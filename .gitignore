@@ -1,0 +1,6 @@
+/config.json
+/var/
+/monitored-repos/
+__pycache__/
+*.pyc
+.env

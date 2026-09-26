@@ -1,0 +1,41 @@
+{
+  "auto_test_repository": "kopalja/auto-test",
+  "monitored_directory": "monitored-repos",
+  "state_directory": "var",
+  "timezone": "Europe/Bratislava",
+  "soft_budget_minutes": 20,
+  "retention_days": 30,
+  "environment_variables": [],
+  "instructions": "",
+  "agents": {
+    "investigation": {
+      "provider": "claude",
+      "model": "YOUR_CLAUDE_MODEL",
+      "reasoning_effort": "high"
+    },
+    "fixing": {
+      "provider": "codex",
+      "model": "YOUR_CODEX_MODEL",
+      "reasoning_effort": "high"
+    },
+    "verification": {
+      "provider": "claude",
+      "model": "YOUR_CLAUDE_MODEL",
+      "reasoning_effort": "high"
+    }
+  },
+  "repositories": [
+    {
+      "name": "owner/example",
+      "enabled": true,
+      "soft_budget_minutes": 30,
+      "instructions": "Use the documented development setup and synthetic test data.",
+      "test_environment": {
+        "description": "Dedicated integration environment",
+        "allowed_targets": ["kubernetes context dev, namespace auto-test"],
+        "credential_environment_variables": ["KUBECONFIG"],
+        "instructions": "Create resources only in this namespace; remove resources created by this run."
+      }
+    }
+  ]
+}

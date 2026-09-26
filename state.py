@@ -35,6 +35,10 @@ class State:
                 uncertain_since REAL, reconciliations INTEGER NOT NULL DEFAULT 0,
                 error TEXT, updated REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS successors (
+                id TEXT PRIMARY KEY REFERENCES reports(id),
+                run_id TEXT NOT NULL REFERENCES runs(id), report TEXT NOT NULL
+            );
         """)
 
     def close(self):
@@ -65,16 +69,20 @@ class State:
 
     def enqueue(self, report):
         existing = self.report(report["id"])
-        # A recurring finding may update a report, but cannot reopen a closed one
-        # or overwrite a pending patch whose publication is still being recovered.
-        if existing and existing["status"] in {"closed", "pending", "uncertain"}:
+        if existing and existing["status"] == "closed" and report["kind"] != "blocker":
+            return
+        # Keep the latest candidate while preserving any unresolved create intent.
+        if existing and existing["status"] in {"pending", "uncertain"}:
+            with self.db:
+                self.db.execute("INSERT INTO successors(id,run_id,report) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET run_id=excluded.run_id,report=excluded.report",
+                                (report["id"], report["run_id"], json.dumps(report)))
             return
         with self.db:
             self.db.execute("""INSERT INTO reports(id,repository,destination,run_id,kind,title,body,payload,updated)
                 VALUES(:id,:repository,:destination,:run_id,:kind,:title,:body,:payload,:updated)
                 ON CONFLICT(id) DO UPDATE SET run_id=excluded.run_id,title=excluded.title,
                 body=excluded.body,payload=excluded.payload,kind=CASE WHEN reports.url IS NULL THEN excluded.kind ELSE reports.kind END,
-                status='pending',next_retry=0,updated=excluded.updated""",
+                status='pending',next_retry=0,uncertain_since=NULL,reconciliations=0,error=NULL,updated=excluded.updated""",
                 {**report, "payload": json.dumps(report.get("payload", {})), "updated": time.time()})
 
     def report(self, report_id):
@@ -97,6 +105,11 @@ class State:
             raise ValueError("Invalid report update")
         with self.db:
             self.db.execute("UPDATE reports SET " + ",".join(f"{key}=?" for key in values) + ",updated=? WHERE id=?", (*values.values(), time.time(), report_id))
+            if values.get("status") in {"published", "deferred", "closed"}:
+                successor = self.db.execute("SELECT report FROM successors WHERE id=?", (report_id,)).fetchone()
+                if successor:
+                    self.db.execute("DELETE FROM successors WHERE id=?", (report_id,))
+                    self.enqueue(json.loads(successor[0]))
 
     def recover(self):
         with self.db:
@@ -119,4 +132,5 @@ class State:
     def expirable(self, days):
         return self.db.execute("""SELECT * FROM runs WHERE ended<? AND cleanup='clean'
             AND outcome!='running' AND NOT EXISTS (SELECT 1 FROM reports WHERE run_id=runs.id
-            AND status IN ('pending','uncertain','deferred'))""", (time.time() - days * 86400,)).fetchall()
+            AND status IN ('pending','uncertain','deferred'))
+            AND NOT EXISTS (SELECT 1 FROM successors WHERE run_id=runs.id)""", (time.time() - days * 86400,)).fetchall()

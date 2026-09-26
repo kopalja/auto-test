@@ -180,11 +180,13 @@ execution has no hard runtime limit, so the budget is not a spending cap.
 
 Agents use `evidence.py` to record command arguments, working directory, exact
 commit, clean tracked-source status, exit code, timing, and hashed command output.
+External files passed as command arguments are hashed too. Use repeated
+`--artifact PATH` options for additional reproduction fixtures or imported helpers.
 Completed exploration requires a real check receipt against the pinned source.
 Reportable bugs require a failing baseline assertion, a stated expected behavior,
 and reproduction evidence. A verifier can reject a suspected bug. A PR additionally
-requires the same reproduction command/label failing on baseline and passing on
-the committed patch, plus recorded relevant existing checks. A missing suite can
+requires the same reproduction command/label and artifact digests, with failure
+on baseline and success on the committed patch, plus relevant existing checks. A missing suite can
 be covered by an independent build/smoke check with the limitation disclosed.
 Pre-existing failures must be explained. `verified: true` alone is insufficient.
 
@@ -199,7 +201,8 @@ further calls to that provider for the invocation, without a billing/provider fa
 Report identities hash repository + stable component + root cause, excluding SHA.
 Bodies contain a deterministic marker; branches use that identity plus baseline
 SHA. Before any create, the runner lists GitHub issues/PRs including closed ones.
-Open reports are updated in place; deliberately closed reports are not reopened.
+Open reports are updated in place; deliberately closed findings are not reopened.
+Setup blockers can reopen when the condition recurs after closure.
 If an existing PR's head differs from the verified candidate, its body remains
 unchanged and the candidate is deferred for owner review. A newly verified patch
 for an existing issue is retained locally and noted there, rather than opening a
@@ -212,7 +215,8 @@ Checkpoints and the publication outbox are independent. A failed GitHub write
 does not rerun completed testing. Network/auth failures defer publication for an
 hour (rate-limit failures for six hours). An uncertain create is first reconciled;
 it needs two later unsuccessful listing passes and at least a day before a new
-create attempt is eligible. No rapid retry loop or automatic force push is used.
+create attempt is eligible. Newer candidates and their artifacts are retained until
+that attempt resolves. No rapid retry loop or automatic force push is used.
 Owner-edited report bodies may be replaced when that generated report recurs.
 
 If `main` moves before a PR is opened, the patch/branch is retained with a
@@ -247,8 +251,8 @@ var/
 Runtime directories are private (0700); CLI execution uses umask 077. CLI/command
 logs are capped at 2 MB each, draining excess output without killing model work.
 These raw private artifacts may contain sensitive project output. Activity logs
-and selected published excerpts redact known secret environment values, common
-token patterns, authorization headers and private keys. This is best effort, not
+and selected published excerpts redact known secret environment values of at least
+12 characters, common token patterns, authorization headers and private keys. This is best effort, not
 a guarantee for arbitrary secrets; use synthetic data and review credential scopes.
 
 `retention_days` (default 30) expires finished run artifacts with clean cleanup and

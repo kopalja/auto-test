@@ -24,6 +24,10 @@ def authors(settings):
 
 
 def finding_body(run_id, sha, finding, verification, checks, settings, report_id, fix=None):
+    finding = {key: redact(value) if isinstance(value, str) else value for key, value in finding.items()}
+    verification = {key: redact(value) if isinstance(value, str) else value for key, value in verification.items()}
+    if fix:
+        fix = {key: redact(value) if isinstance(value, str) else value for key, value in fix.items()}
     body = header(settings["agents"]["investigation"]["provider"])
     body += f"{finding['title']}\n\nTested commit: `{sha}`. Run: `{run_id}`. Finding: `{report_id}`.\n\n"
     body += f"Expected: {finding['expected']}\n\nObserved: {finding['actual']}\n\nImpact: {finding['impact']}\n\nReproduction:\n{finding['reproduction']}\n\n"
@@ -32,18 +36,19 @@ def finding_body(run_id, sha, finding, verification, checks, settings, report_id
     body += "Recorded command evidence:\n\n"
     for check in checks[:12]:
         # Publish selected, bounded excerpts, never an entire agent transcript.
-        excerpt = Path(check["log"]).read_text(errors="replace")[:1200].replace("```", "'''")
-        argv = json.dumps(check["command"], ensure_ascii=False)
+        excerpt = redact(Path(check["log"]).read_text(errors="replace"))[:1200].replace("```", "'''")
+        argv = redact(json.dumps(check["command"], ensure_ascii=False))
         body += f"- {check['phase']}, commit `{check['sha']}`, exit {check['exit_code']}: `{argv.replace('`', chr(39))}`\n\n```text\n{excerpt}\n```\n\n"
     body += f"Verification: {verification['reason']}\n\nRemaining work/decisions: {finding['decision'] or 'None identified.'}\n\nLimitations: {verification['limitations'] or 'Limited to the checks described above.'}\n\n"
     if fix and fix["limitations"]:
         body += f"Patch limitations: {fix['limitations']}\n\n"
     body += f"Agents: {authors(settings)}\n\n{marker(report_id)}\n"
-    return redact(body)
+    return body
 
 
 def blocker_body(run_id, repository, blocker, settings, report_id):
-    return redact(header(settings["agents"]["investigation"]["provider"]) +
+    blocker = {key: redact(value) for key, value in blocker.items()}
+    return (header(settings["agents"]["investigation"]["provider"]) +
         f"Testing `{repository}` is blocked. Run: `{run_id}`.\n\n"
         f"Capability: {blocker['capability']}\n\nCategory: {blocker['category']}\n\n"
         f"Observed: {blocker['error']}\n\nOwner action: {blocker['owner_action']}\n\n"
@@ -65,12 +70,19 @@ class GitHub:
 
     def reports(self, repository):
         # List all issues/PRs, including closed ones; don't depend on search indexing.
-        output = command(["gh", "api", "--paginate", "--slurp", f"repos/{repository}/issues?state=all&per_page=100"], limit=16_000_000).stdout
-        try:
-            pages = json.loads(output)
-            return [issue for page in pages for issue in page if "<!-- auto-test:" in (issue.get("body") or "")]
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise Failure("Invalid or oversized GitHub report listing; publication deferred") from exc
+        reports, page = [], 1
+        while True:
+            output = command(["gh", "api", f"repos/{repository}/issues?state=all&per_page=100&page={page}"], limit=16_000_000).stdout
+            try:
+                issues = json.loads(output)
+                if not isinstance(issues, list):
+                    raise ValueError()
+                reports.extend(issue for issue in issues if "<!-- auto-test:" in (issue.get("body") or ""))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise Failure("Invalid or oversized GitHub report page; publication deferred") from exc
+            if len(issues) < 100:
+                return reports
+            page += 1
 
     def main_sha(self, repository):
         return json.loads(command(["gh", "api", f"repos/{repository}/git/ref/heads/main"]).stdout)["object"]["sha"]
@@ -82,6 +94,9 @@ class GitHub:
         kind = "pr" if "pull_request" in existing else "issue"
         command(["gh", kind, "edit", str(existing["number"]), "--repo", report["destination"], "--body-file", body_file])
         return existing["html_url"]
+
+    def reopen(self, report, existing):
+        command(["gh", "issue", "reopen", str(existing["number"]), "--repo", report["destination"]])
 
     def create(self, report, body_file):
         if report["kind"] == "pr":
@@ -132,8 +147,11 @@ class Publisher:
         matches = [r for r in existing_reports if marker(report["id"]) in (r.get("body") or "")]
         existing = next((r for r in matches if r["state"] == "open"), matches[0] if matches else None)
         if existing and existing["state"] != "open":
-            self.state.update_report(report["id"], status="closed", url=existing["html_url"], error=None)
-            return
+            if report["kind"] == "blocker":
+                self.github.reopen(report, existing)
+            else:
+                self.state.update_report(report["id"], status="closed", url=existing["html_url"], error=None)
+                return
         if not existing and report["url"]:
             # Known reports that disappeared (e.g. transferred/deleted) are not recreated.
             self.state.update_report(report["id"], status="closed", error="Previously published report is no longer listed; owner review required")
@@ -148,7 +166,7 @@ class Publisher:
             return
         payload = json.loads(report["payload"])
         body_file = Path(payload["body_file"])
-        body_file.write_text(redact(report["body"]))
+        body_file.write_text(report["body"])
         if existing:
             if "pull_request" in existing and (not payload.get("patch_sha") or self.github.pr_sha(report["destination"], existing["number"]) != payload["patch_sha"]):
                 self.state.update_report(report["id"], status="deferred", url=existing["html_url"], error="Existing PR head differs from the verified patch; original report preserved, retained candidate needs owner review")
@@ -156,7 +174,7 @@ class Publisher:
             if "pull_request" not in existing and payload.get("patch_sha"):
                 # An existing issue remains the canonical report. Be explicit that
                 # the newly verified local candidate has not been published as a PR.
-                body_file.write_text(redact(report["body"] + "\nA verified candidate patch is retained in this run's artifacts. This existing issue was reused; no new PR or branch was published.\n"))
+                body_file.write_text(report["body"] + "\nA verified candidate patch is retained in this run's artifacts. This existing issue was reused; no new PR or branch was published.\n")
             url = self.github.edit(report, existing, body_file)
         else:
             if report["kind"] == "pr":

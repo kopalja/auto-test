@@ -37,13 +37,16 @@ def environment(extra=(), *, provider=None):
     return env
 
 
-def redact(value):
+def redact(value, *, high_confidence=False):
     value = str(value)
     for key, secret in os.environ.items():
-        if SECRET_NAME.search(key) and len(secret) >= 4:
+        if SECRET_NAME.search(key) and len(secret) >= 12:
             value = value.replace(secret, "[REDACTED]")
-    value = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", "[REDACTED PRIVATE KEY]", value, flags=re.S)
-    value = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", "[REDACTED]", value)
+    value = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|\Z)", "[REDACTED PRIVATE KEY]", value, flags=re.S)
+    value = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,})", "[REDACTED]", value)
+    if high_confidence:
+        return value
+    value = re.sub(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[REDACTED]", value)
     value = re.sub(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)\S+", r"\1[REDACTED]", value)
     value = re.sub(r'''(?i)((?:password|token|secret|api[_-]?key)\s*["']?\s*[:=]\s*["']?)[^\s,"'<>]+''', r"\1[REDACTED]", value)
     return re.sub(r"([a-z][a-z0-9+.-]*://)[^/@\s]+:[^/@\s]+@", r"\1[REDACTED]@", value, flags=re.I)
@@ -130,7 +133,7 @@ def stop_group(pid):
         os.killpg(pid, signal.SIGKILL)
 
 
-def command(argv, *, cwd=None, env=None, input_text=None, timeout=120, log_path=None, journal=None, limit=2_000_000, check=True):
+def command(argv, *, cwd=None, env=None, input_text=None, timeout=120, log_path=None, journal=None, limit=2_000_000, check=True, separate_stderr=False):
     """No shell interpolation; timeout=None is used for agents and evidence checks.
 
     Drain all output, retain a bounded tail in memory and a bounded log on disk.
@@ -139,6 +142,7 @@ def command(argv, *, cwd=None, env=None, input_text=None, timeout=120, log_path=
     argv = [str(v) for v in argv]
     started = time.monotonic()
     output = bytearray()
+    errors = bytearray()
     truncated = False
     with tempfile.TemporaryFile() as stdin, contextlib.ExitStack() as stack:
         if input_text:
@@ -147,7 +151,7 @@ def command(argv, *, cwd=None, env=None, input_text=None, timeout=120, log_path=
         log = stack.enter_context(Path(log_path).open("wb")) if log_path else None
         written = 0
         try:
-            proc = subprocess.Popen(argv, cwd=cwd, env=env if env is not None else environment(), stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+            proc = subprocess.Popen(argv, cwd=cwd, env=env if env is not None else environment(), stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT, start_new_session=True)
         except OSError as exc:
             raise Failure(f"Cannot start {Path(argv[0]).name}: {exc.strerror}") from exc
         try:
@@ -155,6 +159,8 @@ def command(argv, *, cwd=None, env=None, input_text=None, timeout=120, log_path=
                 write_json(journal, {"identity": process_identity(proc.pid), "active": True})
             with selectors.DefaultSelector() as selector:
                 selector.register(proc.stdout, selectors.EVENT_READ)
+                if separate_stderr:
+                    selector.register(proc.stderr, selectors.EVENT_READ)
                 while selector.get_map() or proc.poll() is None:
                     if timeout is not None and time.monotonic() - started >= timeout:
                         raise Failure(f"{Path(argv[0]).name} timed out")
@@ -163,9 +169,10 @@ def command(argv, *, cwd=None, env=None, input_text=None, timeout=120, log_path=
                         if not chunk:
                             selector.unregister(key.fileobj)
                             continue
-                        output.extend(chunk)
-                        if len(output) > limit:
-                            del output[:-limit]
+                        buffer = errors if key.fileobj is proc.stderr else output
+                        buffer.extend(chunk)
+                        if len(buffer) > limit:
+                            del buffer[:-limit]
                             truncated = True
                         if log and written < limit:
                             part = chunk[:limit - written]
@@ -180,9 +187,11 @@ def command(argv, *, cwd=None, env=None, input_text=None, timeout=120, log_path=
             stop_group(proc.pid)
             proc.wait()
             proc.stdout.close()
+            if separate_stderr:
+                proc.stderr.close()
             if journal:
                 write_json(journal, {"identity": process_identity(proc.pid), "active": False})
-        result = subprocess.CompletedProcess(argv, proc.returncode, output.decode("utf-8", "replace"), "")
+        result = subprocess.CompletedProcess(argv, proc.returncode, output.decode("utf-8", "replace"), errors.decode("utf-8", "replace"))
         if truncated and log:
             log.write(b"\n[output limit reached; additional output omitted]\n")
         if check and result.returncode:

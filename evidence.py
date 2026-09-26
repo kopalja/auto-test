@@ -6,6 +6,7 @@ published. Receipts are provenance records, not a sandbox against malicious code
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -18,17 +19,42 @@ from repos import git
 from runtime import command, handle_signals, private_directory, write_json
 
 
-def record(directory, cwd, label, phase, argv, env=None):
+LOG = logging.getLogger("auto-test")
+
+
+def reproduction_files(cwd, argv, artifacts):
+    """Fingerprint explicit fixtures and external files passed as arguments."""
+    files = {}
+    for value in [*argv, *artifacts]:
+        path = Path(value)
+        if not path.is_absolute():
+            path = cwd / path
+        try:
+            path = path.resolve()
+            if path.is_file() and (value in artifacts or not path.is_relative_to(cwd)):
+                with path.open("rb") as handle:
+                    files[str(path)] = hashlib.file_digest(handle, "sha256").hexdigest()
+        except OSError:
+            if value in artifacts:
+                raise
+    if any(str((cwd / value).resolve()) not in files for value in artifacts):
+        raise Failure("Reproduction artifacts must be readable files")
+    return files
+
+
+def record(directory, cwd, label, phase, argv, env=None, artifacts=()):
     directory, cwd = private_directory(directory), Path(cwd).resolve()
     receipt_id = uuid.uuid4().hex
     log = directory / f"{receipt_id}.log"
     sha = git(cwd, "rev-parse", "HEAD")
     clean = not git(cwd, "diff", "HEAD", "--")
+    files = reproduction_files(cwd, argv, artifacts)
     started = time.time()
     result = command(argv, cwd=cwd, env=env if env is not None else dict(os.environ), timeout=None, check=False, log_path=log, journal=directory / f"{receipt_id}.process.json")
     receipt = {
         "version": 1, "label": label, "phase": phase, "command": argv,
-        "cwd": str(cwd), "sha": sha, "clean": clean and git(cwd, "rev-parse", "HEAD") == sha and not git(cwd, "diff", "HEAD", "--"),
+        "cwd": str(cwd), "sha": sha, "clean": clean and git(cwd, "rev-parse", "HEAD") == sha and not git(cwd, "diff", "HEAD", "--") and files == reproduction_files(cwd, argv, artifacts),
+        "reproduction_files": files,
         "exit_code": result.returncode, "started": started, "ended": time.time(),
         "log": str(log), "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
     }
@@ -52,8 +78,8 @@ def artifact(run_directory, filename):
 def receipts(run_directory, paths):
     result = []
     for filename in paths:
-        path = artifact(run_directory, filename)
         try:
+            path = artifact(run_directory, filename)
             data = json.loads(path.read_text())
             log = artifact(run_directory, data["log"])
             if data.get("version") != 1 or type(data["exit_code"]) is not int or not re.fullmatch(r"[a-f0-9]{40,64}", data["sha"]):
@@ -66,10 +92,12 @@ def receipts(run_directory, paths):
                 raise ValueError()
             if hashlib.sha256(log.read_bytes()).hexdigest() != data["log_sha256"]:
                 raise ValueError()
-            if data["exit_code"] and not log.read_text(errors="replace").strip():
+            files = data.get("reproduction_files", {})
+            if not isinstance(files, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not re.fullmatch(r"[a-f0-9]{64}", v) for k, v in files.items()):
                 raise ValueError()
-        except (KeyError, TypeError, ValueError) as exc:
-            raise Failure("Invalid command evidence receipt") from exc
+        except (Failure, OSError, KeyError, TypeError, ValueError) as exc:
+            LOG.warning("Ignoring invalid command evidence receipt %s: %s", filename, exc)
+            continue
         result.append(data)
     return result
 
@@ -82,7 +110,7 @@ def verified(checks, baseline, patch_sha):
     failures = reproduced(checks, baseline)
     passes = [c for c in checks if c["phase"] == "patched" and c["sha"] == patch_sha and c["clean"] and c["exit_code"] == 0]
     existing = [c for c in checks if c["phase"] == "check" and c["sha"] == patch_sha and c["clean"]]
-    return bool(existing) and any(a["label"] == b["label"] and a["command"] == b["command"] for a in failures for b in passes)
+    return bool(existing) and any(a["label"] == b["label"] and a["command"] == b["command"] and "reproduction_files" in a and a["reproduction_files"] == b.get("reproduction_files") for a in failures for b in passes)
 
 
 def main():
@@ -91,6 +119,7 @@ def main():
     parser.add_argument("--cwd", type=Path, required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--phase", choices=("baseline", "patched", "check"), required=True)
+    parser.add_argument("--artifact", action="append", default=[], help="Reproduction dependency to hash (repeat for fixtures/imported helpers)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     argv = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -99,7 +128,7 @@ def main():
     os.umask(0o077)
     try:
         with handle_signals():
-            path, code = record(args.directory, args.cwd, args.label, args.phase, argv)
+            path, code = record(args.directory, args.cwd, args.label, args.phase, argv, artifacts=args.artifact)
             print(path)
             return code if 0 <= code <= 125 else 1
     except (Failure, KeyboardInterrupt) as exc:

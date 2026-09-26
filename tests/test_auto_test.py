@@ -196,6 +196,9 @@ class FakeGitHub:
         existing["body"] = Path(body_file).read_text()
         return existing["html_url"]
 
+    def reopen(self, report, existing):
+        existing["state"] = "open"
+
 
 class SeededAgent:
     def __init__(self, *, findings=True, disposition="fix", supported=True, reject=False, blocked=False, two=False):
@@ -729,8 +732,8 @@ class AdapterTests(Fixture):
         receipt, code = evidence.record(self.root / "evidence", workspace, "case", "baseline", [sys.executable, "-c", "print('failure'); raise SystemExit(1)"])
         data = json.loads(receipt.read_text())
         Path(data["log"]).write_text("invented evidence")
-        with self.assertRaisesRegex(config.Failure, "receipt"):
-            evidence.receipts(self.root, [str(receipt)])
+        with self.assertLogs("auto-test", level="WARNING"):
+            self.assertEqual(evidence.receipts(self.root, [str(receipt)]), [])
 
     def test_receipt_without_phase_is_rejected(self):
         workspace = self.repository()
@@ -738,17 +741,203 @@ class AdapterTests(Fixture):
         data = json.loads(receipt.read_text())
         del data["phase"]
         runtime.write_json(receipt, data)
-        with self.assertRaisesRegex(config.Failure, "receipt"):
-            evidence.receipts(self.root, [str(receipt)])
+        with self.assertLogs("auto-test", level="WARNING"):
+            self.assertEqual(evidence.receipts(self.root, [str(receipt)]), [])
 
     def test_mismatched_reproduction_does_not_verify_patch(self):
-        base = {"label": "case", "command": ["test"], "phase": "baseline", "sha": "a", "clean": True, "exit_code": 1}
+        base = {"label": "case", "command": ["test"], "phase": "baseline", "sha": "a", "clean": True, "exit_code": 1, "reproduction_files": {}}
         patched = {**base, "phase": "patched", "sha": "b", "exit_code": 0, "command": ["different-test"]}
         check = {**patched, "phase": "check"}
         self.assertFalse(evidence.verified([base, patched, check], "a", "b"))
         patched["command"] = ["test"]
         self.assertTrue(evidence.verified([base, patched, check], "a", "b"))
         self.assertFalse(evidence.verified([base, patched], "a", "b"))
+
+
+class ReviewRegressionTests(Fixture):
+    setup_runner = RunnerTests.setup_runner
+
+    def advance_main(self):
+        (self.source / "new.txt").write_text("New snapshot")
+        repos.git(self.source, "add", "new.txt")
+        repos.git(self.source, "commit", "-m", "Advance main")
+        self.remote.sha = repos.git(self.source, "rev-parse", "HEAD")
+
+    def test_redact_full_evidence_before_truncating_and_preserve_marker(self):
+        log = self.root / "check.log"
+        secret = "sensitive-value-" * 150
+        settings = config.repository_settings(self.config, {})
+        check = {"log": str(log), "command": ["test"], "phase": "baseline", "sha": "a" * 40, "exit_code": 1}
+        for output in ("-----BEGIN PRIVATE KEY-----\n" + "private-material" * 150 + "\n-----END PRIVATE KEY-----", secret):
+            log.write_text(output)
+            with patch.dict(os.environ, {"LONG_SECRET": secret, "DB_PASSWORD": "test"}):
+                body = github.finding_body("run", "a" * 40, agents.FINDING_EXAMPLE, {"reason": "test", "limitations": ""}, [check], settings, "test-id")
+                blocker = github.blocker_body("run", "owner/project", agents.BLOCKER_EXAMPLE, settings, "test-id")
+            self.assertNotIn("private-material", body)
+            self.assertNotIn("sensitive-value", body)
+            self.assertIn(github.marker("test-id"), body)
+            self.assertIn(github.marker("test-id"), blocker)
+
+    def test_normal_authentication_code_can_be_patched(self):
+        workspace = self.repository()
+        sha = repos.git(workspace, "rev-parse", "HEAD")
+        (workspace / "auth.py").write_text('token = get_token()\npassword=password\napi_key: str\nurl = "https://user:password@example.com"\nfixture = "eyJfoo.bar.baz"\n# regression test\n')
+        with patch.dict(os.environ, {"DB_PASSWORD": "test"}):
+            patch_sha = repos.prepare_patch(workspace, sha, ["auth.py"], self.root / "fix.patch")
+        self.assertNotEqual(sha, patch_sha)
+
+    def test_patch_still_rejects_high_confidence_credentials(self):
+        workspace = self.repository()
+        sha = repos.git(workspace, "rev-parse", "HEAD")
+        for secret in ("ghp_abcdefghijklmnopqrst", "known-private-secret-value", "-----BEGIN PRIVATE KEY-----\nprivate material\n-----END PRIVATE KEY-----"):
+            (workspace / "auth.py").write_text(secret + "\n")
+            with patch.dict(os.environ, {"SERVICE_SECRET": "known-private-secret-value"}):
+                with self.assertRaisesRegex(config.Failure, "credential"):
+                    repos.prepare_patch(workspace, sha, ["auth.py"], self.root / "fix.patch")
+
+    def test_new_candidate_survives_publication_backoff_and_restart(self):
+        self.setup_runner()
+        self.runner.run_repo(self.repo)
+        old = self.state_db.reports()[0]
+        self.remote.unavailable = True
+        self.runner.publisher.publish()
+        self.advance_main()
+        self.remote.unavailable = False
+        self.runner.run_repo(self.repo)
+        self.assertEqual(self.state_db.checkpoint(self.repo["name"]), self.remote.sha)
+        successor = self.state_db.db.execute("SELECT run_id FROM successors").fetchone()[0]
+        with self.state_db.db:
+            self.state_db.db.execute("UPDATE runs SET ended=0")
+        self.assertNotIn(successor, [r["id"] for r in self.state_db.expirable(1)])
+        reopened = self.state(self.root / "state.sqlite3")
+        reopened.update_report(old["id"], next_retry=0)
+        publisher = github.Publisher(reopened, self.remote)
+        publisher.publish()
+        current = reopened.report(old["id"])
+        self.assertEqual(current["status"], "pending")
+        self.assertEqual(current["run_id"], successor)
+        publisher.publish()
+        self.assertEqual(reopened.report(old["id"])["status"], "published")
+        self.assertEqual(json.loads(self.remote.created[0]["payload"])["sha"], self.remote.sha)
+
+    def test_successor_does_not_overwrite_uncertain_create(self):
+        self.setup_runner(SeededAgent(disposition="issue"))
+        self.runner.run_repo(self.repo)
+        self.remote.fail_create = True
+        self.runner.publisher.publish()
+        old = self.state_db.reports()[0]
+        self.advance_main()
+        self.runner.run_repo(self.repo)
+        self.assertEqual(self.state_db.report(old["id"])["run_id"], old["run_id"])
+        self.assertEqual(self.state_db.report(old["id"])["uncertain_since"], old["uncertain_since"])
+        self.state_db.update_report(old["id"], next_retry=0)
+        self.runner.publisher.publish()
+        self.assertEqual(self.state_db.report(old["id"])["status"], "pending")
+        self.runner.publisher.publish()
+        self.assertEqual(len(self.remote.created), 1)
+        self.assertEqual(self.state_db.report(old["id"])["status"], "published")
+
+    def test_closed_blocker_recurs_and_is_visible_in_status(self):
+        self.setup_runner(SeededAgent(findings=False))
+        self.runner.run_repo(self.repo)
+        run = self.state_db.status()["repositories"][0]
+        def recur():
+            self.runner.blocker(run["id"], self.repo, run["artifacts"], "agent execution", "authentication", "Login expired", "Log in again")
+        recur()
+        self.runner.publisher.publish()
+        old = self.state_db.reports()[0]
+        self.remote.items[0]["state"] = "closed"
+        self.state_db.update_report(old["id"], status="closed")
+        recur()
+        self.assertEqual(self.state_db.status()["blockers"][0]["status"], "pending")
+        self.runner.publisher.publish()
+        self.assertEqual(self.remote.items[0]["state"], "open")
+        self.assertEqual(len(self.remote.created), 1)
+
+    def test_invalid_receipt_does_not_drop_later_findings(self):
+        self.setup_runner(SeededAgent(two=True))
+        invoke = self.agent.invoke
+        def invalid_first(stage, *args):
+            response = invoke(stage, *args)
+            if stage == "investigation":
+                response["findings"][0]["evidence"] = [str(self.root / "missing.json")]
+                agents.validate_result(response, self.root)
+            return response
+        with patch.object(self.agent, "invoke", side_effect=invalid_first), self.assertLogs("auto-test", level="WARNING"):
+            self.assertEqual(self.runner.run_repo(self.repo), "completed")
+        self.assertEqual(len(self.state_db.reports()), 1)
+        self.assertEqual(self.state_db.reports()[0]["kind"], "pr")
+
+    def test_silent_failure_receipt_is_valid(self):
+        workspace = self.repository()
+        receipt, code = evidence.record(self.root / "evidence", workspace, "silent check", "check", [sys.executable, "-c", "raise SystemExit(1)"])
+        checks = evidence.receipts(self.root, [str(receipt)])
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["exit_code"], 1)
+
+    def test_changing_external_reproduction_cannot_verify_patch(self):
+        workspace = self.repository()
+        script = self.root / "reproduce.py"
+        argv = [sys.executable, str(script)]
+        script.write_text("print('failed assertion'); raise SystemExit(1)\n")
+        before, _ = evidence.record(self.root / "evidence", workspace, "case", "baseline", argv)
+        script.write_text("print('different assertion passes')\n")
+        after, _ = evidence.record(self.root / "evidence", workspace, "case", "patched", argv)
+        suite, _ = evidence.record(self.root / "evidence", workspace, "suite", "check", [sys.executable, "-c", "pass"])
+        checks = evidence.receipts(self.root, [str(before), str(after), str(suite)])
+        sha = repos.git(workspace, "rev-parse", "HEAD")
+        self.assertFalse(evidence.verified(checks, sha, sha))
+        self.assertNotEqual(checks[0]["reproduction_files"], checks[1]["reproduction_files"])
+
+    def test_explicit_fixture_dependency_is_fingerprinted(self):
+        workspace = self.repository()
+        fixture = self.root / "fixture.txt"
+        fixture.write_text("first")
+        argv = [sys.executable, "-c", "pass"]
+        before, _ = evidence.record(self.root / "evidence", workspace, "case", "baseline", argv, artifacts=[str(fixture)])
+        fixture.write_text("second")
+        after, _ = evidence.record(self.root / "evidence", workspace, "case", "patched", argv, artifacts=[str(fixture)])
+        checks = evidence.receipts(self.root, [str(before), str(after)])
+        self.assertNotEqual(checks[0]["reproduction_files"], checks[1]["reproduction_files"])
+
+    def test_fenced_or_prefixed_json_is_accepted_by_both_adapters(self):
+        for provider in ("codex", "claude"):
+            for wrapper in ("```json\n{}\n```", "Here is the result:\n{}"):
+                output = wrapper.format(json.dumps(result()))
+                def fake(argv, **kwargs):
+                    if provider == "codex":
+                        Path(argv[argv.index("--output-last-message") + 1]).write_text(output)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"result": output}), "")
+                spec = {"provider": provider, "model": "chosen", "reasoning_effort": "high"}
+                context = {"run_directory": str(self.root), "started": time.time(), "test_environment": {}}
+                with patch.object(agents.Agent, "check"), patch("agents.command", side_effect=fake):
+                    response = agents.Agent().invoke("investigation", spec, context, self.root, self.root / "stage")
+                self.assertEqual(response["outcome"], "completed")
+        with self.assertRaises(ValueError):
+            agents.parse_result('{}\n{}')
+
+    def test_failure_classification_ignores_project_stdout(self):
+        for diagnostic, category in (("CLI crashed", "agent_failure"), ("Error: usage limit reached", "subscription_exhausted"), ("Error: authentication expired", "authentication")):
+            response = subprocess.CompletedProcess([], 1, "Project tests: quota rate limit authentication expired", diagnostic)
+            self.assertEqual(agents.classify_failure(agents.failure_detail(response)), category)
+        response = subprocess.CompletedProcess([], 1, json.dumps({"is_error": True, "result": "Invalid model", "transcript": "quota"}), "")
+        self.assertEqual(agents.classify_failure(agents.failure_detail(response)), "compatibility")
+
+    def test_subprocess_stdout_and_stderr_are_separate(self):
+        response = runtime.command([sys.executable, "-c", "import sys; print('quota test output'); print('CLI crash', file=sys.stderr); sys.exit(1)"], check=False, separate_stderr=True)
+        self.assertEqual(response.stdout.strip(), "quota test output")
+        self.assertEqual(response.stderr.strip(), "CLI crash")
+
+    def test_github_listing_filters_each_page(self):
+        ordinary = {"body": "ordinary issue"}
+        first = {"body": github.marker("first")}
+        last = {"body": github.marker("last")}
+        responses = [subprocess.CompletedProcess([], 0, json.dumps([ordinary] * 99 + [first])), subprocess.CompletedProcess([], 0, json.dumps([last]))]
+        with patch("github.command", side_effect=responses) as command:
+            self.assertEqual(github.GitHub().reports("owner/project"), [first, last])
+        self.assertIn("page=1", command.call_args_list[0].args[0][-1])
+        self.assertIn("page=2", command.call_args_list[1].args[0][-1])
+        self.assertNotIn("--slurp", command.call_args_list[0].args[0])
 
 
 class LifecycleTests(Fixture):

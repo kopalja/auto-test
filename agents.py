@@ -71,6 +71,10 @@ For before/after comparison use exactly the same label AND command arguments, wi
 only --cwd changing. Put reusable reproduction scripts in the run artifact directory
 and import the code from the selected cwd. Do not change tracked files in baseline
 or verification checkouts. Scripts/new tests can live outside those checkouts.
+External files passed as command arguments are hashed by the helper. List every
+additional reproduction dependency (fixtures, imported helpers, scripts invoked
+inside shell/inline commands) with --artifact PATH before --. Keep these files
+unchanged between baseline and patched checks; the runner compares their digests.
 Record relevant existing checks with --phase check against the patched commit too;
 the runner requires these receipts for a PR. Disclose pre-existing failures with
 baseline evidence. If no existing suite exists, run a relevant independent smoke
@@ -129,8 +133,6 @@ def validate_result(value, run_directory):
         if not isinstance(value[field], list):
             raise Failure(f"Agent result: {field} must be a list")
     string_list(value["checks"], "checks")
-    for path in value["checks"]:
-        artifact(run_directory, path)
     for finding in value["findings"]:
         if not isinstance(finding, dict) or set(FINDING_EXAMPLE) - set(finding):
             raise Failure("Malformed finding")
@@ -139,8 +141,6 @@ def validate_result(value, run_directory):
         if finding["disposition"] not in ("fix", "issue") or not isinstance(finding["decision"], str):
             raise Failure("Invalid finding disposition/decision")
         string_list(finding["evidence"], "finding.evidence")
-        for path in finding["evidence"]:
-            artifact(run_directory, path)
     for blocker in value["blockers"]:
         if not isinstance(blocker, dict) or set(BLOCKER_EXAMPLE) - set(blocker):
             raise Failure("Malformed blocker")
@@ -166,8 +166,6 @@ def validate_result(value, run_directory):
         if not isinstance(verification["limitations"], str):
             raise Failure("Invalid verification limitations")
         string_list(verification["checks"], "verification.checks")
-        for path in verification["checks"]:
-            artifact(run_directory, path)
     if not isinstance(value["overrun_reason"], str):
         raise Failure("Invalid overrun reason")
     return value
@@ -207,6 +205,31 @@ def classify_failure(output):
     if any(v in lowered for v in ("unsupported", "unknown model", "invalid model", "reasoning effort")):
         return "compatibility"
     return "agent_failure"
+
+
+def parse_result(output):
+    """Accept one JSON object, optionally fenced or introduced by prose."""
+    decoder = json.JSONDecoder()
+    start = output.find("{")
+    if start < 0:
+        raise ValueError("No result object")
+    value, end = decoder.raw_decode(output, start)
+    if not isinstance(value, dict) or output[end:].strip() not in ("", "```"):
+        raise ValueError("Ambiguous result object")
+    return value
+
+
+def failure_detail(result):
+    # Only the CLI error envelope or its final stderr diagnostic classifies a
+    # failure. Project output in stdout must not exhaust the provider globally.
+    try:
+        envelope = json.loads(result.stdout)
+        if isinstance(envelope, dict) and envelope.get("is_error"):
+            return str(envelope.get("error") or envelope.get("result") or "Agent error")
+    except ValueError:
+        pass
+    lines = (result.stderr or "").strip().splitlines()
+    return lines[-1] if lines else "Agent command failed; inspect the private stage log"
 
 
 class Agent:
@@ -256,21 +279,23 @@ class Agent:
             argv = ["codex", "exec", "--ignore-user-config", "--model", spec["model"], "-c", 'model_provider="openai"', "-c", 'forced_login_method="chatgpt"', "-c", f'model_reasoning_effort={json.dumps(spec["reasoning_effort"])}', "-c", 'approval_policy="never"', "--sandbox", "danger-full-access", "--color", "never", "--output-last-message", str(output), "-"]
         else:
             argv = ["claude", *claude_options(), "--print", "--model", spec["model"], "--effort", spec["reasoning_effort"], "--dangerously-skip-permissions", "--no-session-persistence", "--output-format", "json"]
-        result = command(argv, cwd=workspace, env=env, input_text=prompt, timeout=None, log_path=stage_directory / "agent.log", journal=stage_directory / "agent.process.json", check=False)
+        result = command(argv, cwd=workspace, env=env, input_text=prompt, timeout=None, log_path=stage_directory / "agent.log", journal=stage_directory / "agent.process.json", check=False, separate_stderr=True)
         if result.returncode:
-            category = classify_failure(result.stdout)
-            raise AgentFailure(redact(f"{provider} {stage} failed ({category}): {result.stdout[-1500:]}"), category)
+            detail = failure_detail(result)
+            category = classify_failure(detail)
+            raise AgentFailure(f"{provider} {stage} failed ({category}): {redact(detail)[-1500:]}", category)
         try:
             if provider == "claude":
                 envelope = json.loads(result.stdout)
                 if envelope.get("is_error"):
-                    raise AgentFailure(redact(str(envelope.get("result", "Claude error"))), classify_failure(str(envelope)))
+                    detail = failure_detail(result)
+                    raise AgentFailure(redact(detail), classify_failure(detail))
                 # Some versions return JSON text, others expose structured_output.
                 raw = envelope.get("structured_output")
                 if raw is None:
-                    raw = json.loads(envelope["result"])
+                    raw = parse_result(envelope["result"])
                 write_json(output, raw)
-            raw = json.loads(artifact(context["run_directory"], output).read_text())
+            raw = parse_result(artifact(context["run_directory"], output).read_text())
             try:
                 return validate_result(raw, context["run_directory"])
             except Failure as exc:

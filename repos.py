@@ -95,7 +95,7 @@ def prepare_patch(workspace, baseline, files, destination):
     if len(patch.encode()) > 2_000_000:
         raise Failure("Patch exceeds 2 MB; requires owner review")
     from runtime import redact
-    if redact(patch) != patch:
+    if redact(patch, high_confidence=True) != patch:
         raise Failure("Potential credential in patch; retained locally, publication blocked")
     Path(destination).write_text(patch)
     git(workspace, "-c", "user.name=auto-test", "-c", "user.email=auto-test@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "Fix reproduced auto-test finding")

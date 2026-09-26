@@ -22,6 +22,10 @@ def default(stage):
               'cleanup': 'nothing created', 'overrun_reason': None}
     return {**common, **{
         'investigation': {'findings': [], 'worth_continuing': False},
+        'deployment': {'identity': '', 'ready': False, 'checks': [], 'limitations': []},
+        'baseline': {'experiments': [], 'findings': [], 'untested': [], 'worth_continuing': False},
+        'exploration': {'experiments': [], 'findings': [], 'untested': [], 'worth_continuing': False},
+        'teardown': {'absent': False, 'checks': [], 'limitations': []},
         'fixing': {'fixed': False, 'files': [], 'regression_tests': [], 'explanation': 'not fixed', 'checks': [],
                    'unresolved': []},
         'verification': {'verdict': 'rejected', 'fix_verdict': 'not_applicable', 'checks': [],

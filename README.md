@@ -6,6 +6,11 @@ A small Python standard-library runner. Each night it tests the current `main` o
 
 The runner owns scheduling, commit selection, state, result validation, publication, deduplication and interruption handling. The agents own the exploratory work. It uses the owner's existing **Codex (ChatGPT)** and **Claude Code** subscription logins and never switches to API billing.
 
+For operational testing, enable **deployment mode** per repository. It deploys the pinned commit,
+demonstrates a complete user workflow, explores failure or boundary scenarios, then tears down and
+checks resource absence. Project-specific knowledge lives in the monitored repository's `auto-test.md`
+and scripts; the runner has no infrastructure- or application-specific branches.
+
 ## How a run works
 
 1. **Discovery.** Every immediate child directory of `monitored-repos/` that has a `.git` entry and a GitHub `origin` is monitored. SSH (`git@github.com:o/r.git`, `ssh://git@github.com/o/r`) and HTTPS origins are accepted and normalized to `owner/repo`. When two checkouts share an origin, the first by name is used. auto-test only reads their origin. It never pulls, resets, cleans or edits them.
@@ -17,7 +22,7 @@ The runner owns scheduling, commit selection, state, result validation, publicat
    - No `main` branch: reported as a blocker. Another branch is never tested instead.
 
    If `main` moves during a run, the run finishes against the pinned SHA.
-3. **Investigation.** The agent works in a separate checkout (`var/runs/<run>/workspace`). It is given the budget, the changes, known open reports and the environment boundaries, and returns validated JSON with findings, coverage, blockers and cleanup status. Further rounds run while at least 25% of the budget remains and the agent reports that valuable areas remain.
+3. **Investigation.** In the default `source` mode, the agent works in a separate checkout (`var/runs/<run>/workspace`). It is given the budget, the changes, known open reports and the environment boundaries, and returns validated JSON with findings, coverage, blockers and cleanup status. Further rounds run while at least 25% of the budget remains and the agent reports that valuable areas remain. In `deployment` mode, the lifecycle described below replaces this investigation loop.
 4. **Fixing.** A finding with a clear, local remedy is fixed on a branch `auto-test/fix-<finding>-<run>` that starts at the tested commit. Fixes are never stacked. The runner commits only the files the agent lists, rejects diffs that look like secrets, and permits one correction attempt after an ineffective fix.
 5. **Verification.** A fresh session scrutinizes each finding: a failing reproduction on the baseline, success with the patch, relevant existing checks, and disclosure of pre-existing failures. **The runner does not trust a `verified` claim.** A PR is only published when the result contains a baseline check that observed the bug and a patched check that did not. Each check needs a non-empty evidence file in the run directory.
 6. **Publication** through `gh`, by the runner only:
@@ -123,10 +128,67 @@ A dry run does real testing and prepares PR/issue bodies in `var/dry-run/runs/<r
 Repository entries (`name` is required) override discovered repositories. An entry without a checkout in `monitored-repos/` is ignored; entries never add repositories.
 
 - `enabled`: `false` disables the repository. Removing the checkout also works.
+- `mode`: `source` (default, existing investigation workflow) or `deployment` (operational exploration).
+  Changing modes triggers a run even when the current checkpoint's commit is unchanged.
 - `soft_budget_minutes`, `instructions`: `instructions` is appended to the global instructions.
 - `agents`: per-stage partial overrides, for example `{"fixing": {"provider": "codex", "model": "gpt-6-sol"}}`. When switching the provider, also set `model` and `reasoning_effort` for it.
 - `test_environment`: `description`, `allowed_targets` (a list of free-text target descriptions), `credential_environment_variables` (names passed only to this repository's agents) and `instructions`.
 - `clone_url`: Git URL for the runner-owned clone.
+
+### Deployment mode
+
+Set `"mode": "deployment"` in the repository's configuration entry. Add an
+[`auto-test.md` contract](examples/auto-test.md) to the monitored repository describing its deployment,
+readiness probes, critical workflows, recovery expectations, teardown and absence checks. Use existing
+project scripts for repeatable setup; no additional command DSL is required. Without a contract, the
+agent tries the pinned project documentation and reports a blocker if no usable recipe can be established.
+The runner snapshots the contract before setup. Never put credentials in it.
+
+Environment targets and credential variable names belong in `test_environment`; put resource limits,
+allowed failure operations and environment constraints in `test_environment.instructions`. These are
+agent instructions, not infrastructure-enforced quotas. Project documentation cannot expand the allowed
+targets. Local disposable services need no cloud target. Detached services must survive the agent's
+process group ending between stages.
+
+The lifecycle is:
+
+1. **Deploy and check readiness.** The investigation provider deploys the tested revision and records
+   deployment identity, actual probe commands, outputs and expected/observed results. A readiness claim
+   needs passing checks with non-empty evidence files outside the disposable workspace.
+2. **Demonstrate a baseline workflow.** A separate session exercises a complete user workflow against
+   the running deployment. Readiness probes and existing unit tests do not count. Fault exploration
+   starts only after a workflow passes.
+3. **Explore.** Further sessions derive relevant failure or boundary experiments from the contract,
+   changes and project behavior. Each records its hypothesis, expected-behavior basis, reproducible
+   actions, observations, evidence and recovery. Reusable scripts belong in the evidence directory.
+   New rounds stop when fewer than 20% of the shared budget remains or no valuable experiment remains.
+4. **Tear down and verify absence.** The verification provider uses the project recipe and run-owned
+   resource receipts, then performs inventory checks. Teardown runs even after failed setup, malformed
+   agent output, or an empty manifest. `absent=true` alone is insufficient: passing evidence-backed checks
+   and an empty unresolved-resource manifest are required.
+5. **Handle findings.** Once teardown succeeds, confirmed candidate findings enter the existing fix and
+   independent verification pipeline. Failed experiments alone do not automatically become GitHub issues.
+   If a deployed reproduction is needed again, the verifier must recreate it within the same boundaries;
+   results against the earlier baseline deployment cannot establish that a patch works.
+
+Every deployment run writes `operational-report.md`, `deployment.json` and an `operational` section in
+`run.json`, including runs with no bugs. The report distinguishes executed experiments from unsupported
+claims and lists untested areas. Its verdict is `passed`, `failed` or `incomplete`; the runner's `completed`
+status means testing finished, not that the application passed. Operational success requires readiness,
+a passing workflow, at least one executed failure/boundary scenario, verified cleanup and no reported
+confidence gaps. Evidence files substantiate agent observations; the runner does not independently prove
+the semantics of every assertion.
+
+Deployment state is persisted before setup. Interrupted teardown is retried on later invocations using
+the original environment boundaries, pinned commit and contract, even if repository configuration changes
+or monitoring is disabled. After three unsuccessful cleanup attempts it needs operator intervention,
+as with existing resource cleanup. New deployments for that repository wait while teardown is unresolved.
+An unrecorded resource can only be recovered if it is discoverable by the run ID; resource labeling and
+complete inventory instructions are essential.
+
+As in source mode, `partial` runs advance the checkpoint; use `--force` to revisit gaps at an unchanged
+commit. Experiment artifacts follow normal run retention. A cross-run scenario library, automatic replay
+and test-only PRs are not part of this first version.
 
 **Models and effort.** Models are free-form provider identifiers; there is no list of model names to freeze. Use a Claude model or alias for `claude` (for example an Opus model) and a Codex catalog slug for `codex`. `reasoning_effort` maps to Codex `model_reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, as supported by the model in the installed catalog) or to Claude `--effort` (`low`, `medium`, `high`, `xhigh`, `max`). An unsupported combination is rejected with a clear message and never substituted. Agents run noninteractively with full shell and file access: Codex uses `--sandbox danger-full-access` with approvals disabled; Claude uses `bypassPermissions` without user settings or MCP servers.
 
@@ -176,6 +238,7 @@ The activity log records repository, commit, stages, providers/models/efforts, d
 - `changes.txt`
 - `stages/*/`: `prompt.md`, `transcript.jsonl`, `result.json`.
 - `evidence/`
+- `project-contract.md`, `deployment.json`, `operational-report.md` (deployment mode)
 - `resources.jsonl`
 - `reports/*.md`
 
@@ -215,7 +278,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 ```sh
-python3 -m py_compile auto_test.py agents.py github.py state.py util.py
+python3 -m py_compile auto_test.py agents.py deployment.py github.py state.py util.py
 ```
 
 The tests use temporary repositories, a scripted fake `codex`/`claude` executable (`tests/fake_agent.py`) and a mocked GitHub. They spend no subscription usage, touch no live infrastructure and publish nothing.
@@ -224,6 +287,7 @@ Files:
 
 - `auto_test.py`: configuration, discovery, Git clones, run orchestration and the CLI.
 - `agents.py`: the CLI adapters, prompts and result schemas.
+- `deployment.py`: deployment evidence validation and operational reports.
 - `github.py`: `gh`, rendering, publication and reconciliation.
 - `state.py`: SQLite.
 - `util.py`: subprocesses and redaction.

@@ -275,7 +275,12 @@ class Git:
             raise Failure('Fix diff contains secret-like content')
         self.run('-c', 'user.name=auto-test', '-c', 'user.email=auto-test@invalid', 'commit', '-q', '--no-verify',
                  '-m', message, cwd=ws)
-        return self.out('rev-parse', 'HEAD', cwd=ws).strip()
+        commit = self.out('rev-parse', 'HEAD', cwd=ws).strip()
+        self.prepare(ws, commit)
+        return commit
+
+    def ancestor(self, repo, base, head):
+        return self.run('merge-base', '--is-ancestor', base, head, cwd=self.bare(repo), check=False).returncode == 0
 
     def changed(self, repo, base, head, files):
         return self.out('diff', '--name-only', base, head, '--', *files, cwd=self.bare(repo)).split()
@@ -473,6 +478,7 @@ class Runner:
                 self.state.update_report(row['key'], status='dropped', error='Not confirmed again on the new main')
         blocked = False
         for round_no in range(1, 100 if run.investigate else 1):
+            self.git.prepare(run.workspace, run.sha)
             inv = self.stage(run, 'investigation', f'investigation-{round_no}',
                              self.context(run, 'investigation', share=0.5, round=round_no))
             run.coverage += inv['coverage']
@@ -517,7 +523,7 @@ class Runner:
             if finding['disposition'] == 'fix' and time.time() >= run.deadline:
                 notes.append('The soft time budget was reached before an automated fix could be attempted.')
             elif finding['disposition'] == 'fix':
-                branch, feedback = f'auto-test/fix-{key}', None
+                branch, feedback = f'auto-test/fix-{key}-{run.id}', None
                 for attempt in (1, 2):
                     self.git.prepare(run.workspace, run.sha, branch)
                     fix = self.stage(run, 'fixing', f'{key}/fix-{attempt}', self.context(
@@ -629,16 +635,19 @@ class Runner:
         if latest and latest['status'] in ACTIVE:
             key, generation, status = latest['key'], latest['generation'], latest['status']
             data = json.loads(latest['data'])
-            if repo not in data['affected'] and status == 'published':
-                status = 'update'
             data['affected'][repo] = item
         else:
             generation = latest['generation'] + 1 if latest else 1
             key, status = f'{base}-{generation}', 'prepared' if self.dry_run else 'pending'
             data = {'key': key, 'capability': capability, 'category': category, 'affected': {repo: item},
                     'author': provider or self.cfg['agents']['investigation']['provider']}
+        body = github.render_blocker(data, self.redact)
+        if latest and latest['key'] == key and body != latest['body']:
+            data['needs_update'] = True
+            if status == 'published':
+                status = 'update'
         self.state.save_report(key, base, generation, 'blocker', repo, self.cfg['auto_test_repository'],
-                               f'Setup blocker: {capability}', github.render_blocker(data, self.redact), data,
+                               f'Setup blocker: {capability}', body, data,
                                status, run_id)
         LOG.warning('Blocker %s (%s) for %s: %s', key, capability, repo, item['details'][:300])
 
@@ -761,7 +770,7 @@ class Runner:
         self.blocker(run.repo['name'], run.sha, run.id, 'unresolved test resources', 'infrastructure',
                      f'Run {run.id} could not confirm removal of: {listing}',
                      f'Remove these resources manually if they still exist, then append "removed" lines to '
-                     f'{run.manifest}.')
+                     f'{run.manifest.relative_to(self.state_dir)} under the state directory.')
         return False
 
     def recover(self):

@@ -111,7 +111,10 @@ class State:
                 'first_seen,last_seen,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET '
                 'kind=excluded.kind,title=excluded.title,body=excluded.body,data=excluded.data,'
                 'status=excluded.status,run_id=excluded.run_id,last_seen=excluded.last_seen,'
-                'updated=excluded.updated,attempts=0,next_retry=0,error=NULL',
+                'updated=excluded.updated,'
+                "attempts=CASE WHEN reports.status IN ('pending','uncertain','update') THEN reports.attempts ELSE 0 END,"
+                "next_retry=CASE WHEN reports.status IN ('pending','uncertain','update') THEN reports.next_retry ELSE 0 END,"
+                "error=CASE WHEN reports.status IN ('pending','uncertain','update') THEN reports.error ELSE NULL END",
                 (key, base_key, generation, kind, repo, target, title, body, json.dumps(data), status, run_id,
                  now, now, now))
 

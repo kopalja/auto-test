@@ -2,7 +2,7 @@ import json
 import stat
 
 import github
-from helpers import GOOD_FIX, GOOD_VERIFY, Case, finding
+from helpers import GOOD_FIX, GOOD_VERIFY, Case, finding, git
 from util import Failure, Redactor
 
 ISSUE_PLAN = dict(investigation=[{'actions': [{'do': 'repro'}], 'result': {'findings': [finding(disposition='issue')]}}],
@@ -12,6 +12,77 @@ PR_PLAN = dict(investigation=[{'actions': [{'do': 'repro'}], 'result': {'finding
 
 
 class PublicationTest(Case):
+    def test_revalidated_fix_uses_new_branch_after_failed_pr_create(self):
+        self.set_plan(**PR_PLAN)
+        self.gh.fail['create_pr'] = [Failure('HTTP 422')]
+        self.run_cli('--once')
+        old = json.loads(self.reports()[0]['data'])
+        remote = self.remotes['owner/calc']
+        self.assertEqual(git(remote, 'rev-parse', old['branch']), old['commit'])
+        self.commit('owner/calc')
+        self.set_plan(**PR_PLAN)
+        self.sql('UPDATE reports SET next_retry=0')
+        self.assertEqual(self.run_cli('--once'), 0)
+        [pr] = self.gh.created('pr')
+        self.assertNotEqual(pr['branch'], old['branch'])
+        self.assertEqual(git(remote, 'rev-parse', old['branch']), old['commit'])
+        self.assertEqual(git(remote, 'rev-parse', pr['branch'] + '^'), self.head())
+        self.assertEqual(self.reports()[0]['status'], 'published')
+        # Revalidation runs before investigation, which must still see main.
+        investigation = self.calls('investigation')[-1]
+        self.assertEqual(investigation['head'], self.head())
+        self.assertEqual(investigation['dirty'], '')
+
+    def test_rewritten_main_revalidates_even_when_fix_files_are_unchanged(self):
+        initial = self.head()
+        self.commit('owner/calc', path='removed.txt', content='must stay removed\n')
+        self.set_plan(**PR_PLAN)
+        self.gh.fail['create_pr'] = [Failure('HTTP 422')]
+        self.run_cli('--once')
+        # Simulate a rewritten upstream without a force push: update the fixture ref directly.
+        git(self.remotes['owner/calc'], 'update-ref', 'refs/heads/main', initial)
+        self.set_plan(**PR_PLAN)
+        self.sql('UPDATE reports SET next_retry=0')
+        self.assertEqual(self.run_cli('--once'), 0)
+        [pr] = self.gh.created('pr')
+        self.assertEqual(git(self.remotes['owner/calc'], 'rev-parse', pr['branch'] + '^'), initial)
+        self.assertNotIn('removed.txt', git(self.remotes['owner/calc'], 'ls-tree', '--name-only', pr['branch']))
+        self.assertEqual(len(self.calls('verification')), 2)
+        self.assertIn('main history rewritten', self.log())
+
+    def test_revalidation_can_return_to_an_already_pushed_baseline(self):
+        initial = self.head()
+        self.set_plan(**PR_PLAN)
+        self.gh.fail['create_pr'] = [Failure('HTTP 422'), Failure('HTTP 422')]
+        self.run_cli('--once')
+        old = json.loads(self.reports()[0]['data'])
+        self.commit('owner/calc')
+        self.set_plan(**PR_PLAN)
+        self.sql('UPDATE reports SET next_retry=0')
+        self.run_cli('--once')
+        remote = self.remotes['owner/calc']
+        git(remote, 'update-ref', 'refs/heads/main', initial)
+        self.set_plan(**PR_PLAN)
+        self.sql('UPDATE reports SET next_retry=0')
+        self.assertEqual(self.run_cli('--once'), 0)
+        [pr] = self.gh.created('pr')
+        self.assertNotEqual(pr['branch'], old['branch'])
+        self.assertEqual(git(remote, 'rev-parse', old['branch']), old['commit'])
+        self.assertEqual(git(remote, 'rev-parse', pr['branch'] + '^'), initial)
+
+    def test_unrelated_forward_main_change_does_not_require_revalidation(self):
+        initial = self.head()
+        self.set_plan(**PR_PLAN)
+        self.gh.fail['create_pr'] = [Failure('HTTP 422')]
+        self.run_cli('--once')
+        self.commit('owner/calc', path='README.md')
+        self.set_plan()
+        self.sql('UPDATE reports SET next_retry=0')
+        self.assertEqual(self.run_cli('--once'), 0)
+        [pr] = self.gh.created('pr')
+        self.assertEqual(git(self.remotes['owner/calc'], 'rev-parse', pr['branch'] + '^'), initial)
+        self.assertEqual(len(self.calls('verification')), 1)
+
     def test_publication_failure_retries_without_retesting(self):
         self.set_plan(**PR_PLAN)
         self.gh.fail['create_pr'] = [Failure('HTTP 422')]
@@ -105,6 +176,78 @@ class PublicationTest(Case):
         self.assertEqual(data['sha'], self.head())  # Fixed and verified again on the new main.
         self.assertIn(self.head(), pr['body'])
         self.assertIn('Revalidating', self.log())
+
+
+class BlockerPublicationTest(Case):
+    def blocker_plan(self, details='no docker', action='Install Docker'):
+        self.set_plan(investigation=[{'result': {'outcome': 'blocked', 'blockers': [{
+            'capability': 'Docker daemon', 'category': 'missing_tool', 'details': details,
+            'owner_action': action}]}}])
+
+    def test_refresh_preserves_ambiguous_create_delay(self):
+        self.blocker_plan()
+        self.gh.fail['create_issue'] = [Failure('timeout', ambiguous=True)]
+        self.run_cli('--once')
+        [before] = self.reports()
+        self.run_cli('--once')
+        [after] = self.reports()
+        self.assertEqual(self.gh.calls.count('create_issue'), 1)
+        for field in ('status', 'attempts', 'next_retry', 'error'):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(after['status'], 'uncertain')
+
+    def test_refresh_preserves_rate_limit_backoff(self):
+        self.blocker_plan()
+        self.gh.fail['create_issue'] = [Failure('rate limit', retry_after=7200)]
+        self.run_cli('--once')
+        [before] = self.reports()
+        self.run_cli('--once')
+        [after] = self.reports()
+        self.assertEqual(self.gh.calls.count('create_issue'), 1)
+        self.assertEqual(after['next_retry'], before['next_retry'])
+        self.assertGreater(after['next_retry'], before['updated'] + 7195)
+        self.assertEqual(after['attempts'], 1)
+
+    def test_changed_details_for_same_repository_update_published_issue(self):
+        self.blocker_plan()
+        self.run_cli('--once')
+        self.blocker_plan('daemon stopped', 'Restart Docker')
+        self.run_cli('--once')
+        [issue] = self.gh.created('issue')
+        self.assertIn('daemon stopped', issue['body'])
+        self.assertIn('Restart Docker', issue['body'])
+        self.assertNotIn('Install Docker', issue['body'])
+
+    def test_ambiguous_update_retries_desired_body(self):
+        self.blocker_plan()
+        self.run_cli('--once')
+        self.blocker_plan('daemon stopped', 'Restart Docker')
+        self.gh.fail['update_issue'] = [Failure('timeout', ambiguous=True)]
+        self.run_cli('--once')
+        [report] = self.reports()
+        self.assertEqual(report['status'], 'uncertain')
+        self.assertTrue(json.loads(report['data'])['needs_update'])
+        self.assertNotIn('Restart Docker', self.gh.created()[0]['body'])
+        self.sql('UPDATE reports SET next_retry=0')
+        github.publish(self.state(), self.gh, None)
+        [report] = self.reports()
+        self.assertEqual(report['status'], 'published')
+        self.assertFalse(json.loads(report['data']).get('needs_update'))
+        self.assertEqual((report['attempts'], report['next_retry']), (0, 0))
+        self.assertIn('Restart Docker', self.gh.created()[0]['body'])
+        self.assertEqual(self.gh.calls.count('update_issue'), 2)
+
+    def test_changed_body_survives_lost_create_response(self):
+        self.blocker_plan()
+        self.gh.lost['create_issue'] = 1
+        self.run_cli('--once')
+        self.blocker_plan('daemon stopped', 'Restart Docker')
+        self.run_cli('--once')
+        self.assertNotIn('Restart Docker', self.gh.created()[0]['body'])
+        self.sql('UPDATE reports SET next_retry=0')
+        github.publish(self.state(), self.gh, None)
+        self.assertEqual(len(self.gh.created()), 1)
+        self.assertIn('Restart Docker', self.gh.created()[0]['body'])
 
 
 class GhApiTest(Case):

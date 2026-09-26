@@ -156,7 +156,11 @@ def main():
     stage = ctx['stage']
     with open(os.environ['FAKE_AGENT_LOG'], 'a') as handle:
         handle.write(json.dumps({'provider': provider, 'stage': stage, 'argv': args, 'env': sorted(os.environ),
-                                 'cwd': os.getcwd(), 'pid': os.getpid(), 'ctx': ctx}) + '\n')
+                                 'cwd': os.getcwd(), 'pid': os.getpid(), 'ctx': ctx,
+                                 'head': subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True,
+                                                        text=True).stdout.strip(),
+                                 'dirty': subprocess.run(['git', 'status', '--porcelain'], capture_output=True,
+                                                         text=True).stdout.strip()}) + '\n')
     item = response(stage)
     result = default(stage)
     for action in item.get('actions', []):

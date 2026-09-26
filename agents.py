@@ -258,9 +258,8 @@ def run_stage(adapter, cfg, stage, prompt, workdir, stage_dir, env, add_dir):
                                 start_new_session=True)
         try:
             returncode = proc.wait()
-        except BaseException:
-            stop(proc)  # Forward interruption to the agent's whole process group.
-            raise
+        finally:
+            stop(proc)  # Clean up group members after normal completion or interruption.
     _cap(stage_dir / 'transcript.jsonl')
     result = validate(adapter.parse(stage_dir, returncode), schema)
     (stage_dir / 'result.json').write_text(json.dumps(result, indent=1))

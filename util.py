@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -20,16 +21,19 @@ class Failure(Exception):
 
 def stop(proc, grace=10):
     """Terminate a child's whole process group, escalating to SIGKILL."""
-    if proc.poll() is not None:
-        return
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGTERM)
-    try:
-        proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        proc.poll()  # Reap the leader, but wait for surviving group members too.
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
 
 
 def command(args, *, cwd=None, env=None, data=None, timeout=300, check=True):

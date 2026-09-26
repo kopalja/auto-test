@@ -260,7 +260,10 @@ def publish(state, gh, git):
 
 
 def _published(state, row, found, recovered):
-    state.update_report(row['key'], status='published', url=found['url'], number=found['number'], error=None)
+    data = json.loads(row['data'])
+    data.pop('needs_update', None)
+    state.update_report(row['key'], status='published', url=found['url'], number=found['number'], error=None,
+                        attempts=0, next_retry=0, data=json.dumps(data))
     LOG.info('%s %s %s: %s', 'Recovered' if recovered else 'Published', row['kind'], row['key'], found['url'])
     return 'recovered' if recovered else 'published'
 
@@ -268,11 +271,10 @@ def _published(state, row, found, recovered):
 def publish_issue(state, gh, git, row):
     found = gh.find_marker(row['target'], marker(row['key']))
     if found:
-        if row['status'] == 'update':
+        if row['status'] == 'update' or json.loads(row['data']).get('needs_update'):
             gh.update_issue(row['target'], found['number'], row['body'])
-            state.update_report(row['key'], status='published', url=found['url'], number=found['number'])
             LOG.info('Updated %s %s: %s', row['kind'], row['key'], found['url'])
-            return 'published'
+            return _published(state, row, found, False)
         return _published(state, row, found, True)
     return _published(state, row, gh.create_issue(row['target'], row['title'], row['body']), False)
 
@@ -285,6 +287,11 @@ def publish_pr(state, gh, git, row):
     url = data['clone_url']
     current = git.fetch_main(data['repo'], url)
     if current != data['sha']:
+        if not git.ancestor(data['repo'], data['sha'], current):
+            state.update_report(row['key'], status='revalidate',
+                                error=f'main history rewritten at {current[:12]}')
+            LOG.info('PR %s deferred for revalidation: main history rewritten', row['key'])
+            return 'deferred'
         touched = git.changed(data['repo'], data['sha'], current, data['fix']['files'])
         if touched:
             # Verified only against the old commit; revalidate in the next run instead of guessing.

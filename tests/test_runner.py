@@ -11,6 +11,28 @@ INVESTIGATE_FIX = {'actions': [{'do': 'repro'}], 'result': {'findings': [finding
 
 
 class PipelineTest(Case):
+    def test_verification_starts_with_only_the_committed_fix(self):
+        self.set_plan(investigation=[INVESTIGATE_FIX], fixing=[{
+            **GOOD_FIX, 'actions': [*GOOD_FIX['actions'],
+                                   {'do': 'shell', 'cmd': 'echo experiment >> README.md'}]}],
+            verification=[GOOD_VERIFY])
+        self.assertEqual(self.run_cli('--once'), 0)
+        [verification] = self.calls('verification')
+        self.assertEqual(verification['head'], verification['ctx']['fix_commit'])
+        self.assertEqual(verification['dirty'], '')
+        self.assertEqual(len(self.gh.created('pr')), 1)
+
+    def test_investigation_restores_baseline_after_a_verified_fix(self):
+        self.set_plan(investigation=[{
+            **INVESTIGATE_FIX, 'result': {'findings': [finding()], 'worth_continuing': True}}, {}],
+            fixing=[GOOD_FIX], verification=[GOOD_VERIFY])
+        self.assertEqual(self.run_cli('--once'), 0)
+        rounds = self.calls('investigation')
+        self.assertEqual(len(rounds), 2)
+        for call in rounds:
+            self.assertEqual(call['head'], self.head())
+            self.assertEqual(call['dirty'], '')
+
     def test_seeded_bug_produces_minimal_verified_pr(self):
         self.set_plan(investigation=[{**INVESTIGATE_FIX, 'result': {
             'findings': [finding()], 'coverage': [{'area': 'calc.divide', 'status': 'tested', 'notes': 'repro'}]}}],
@@ -399,6 +421,9 @@ class OperationTest(Case):
         [run] = self.runs()
         self.assertEqual(run['cleanup'], 'pending')
         self.assertIn('unresolved test resources', self.gh.items['owner/auto-test'][0]['title'])
+        body = self.gh.items['owner/auto-test'][0]['body']
+        self.assertNotIn(str(self.tmp), body)
+        self.assertIn(f'runs/{run["id"]}/resources.jsonl', body)
         self.sql("UPDATE runs SET status='running' WHERE id=?", run['id'])
         self.run_cli('--once')
         self.run_cli('--once')

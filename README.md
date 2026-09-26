@@ -18,7 +18,7 @@ The runner owns scheduling, commit selection, state, result validation, publicat
 
    If `main` moves during a run, the run finishes against the pinned SHA.
 3. **Investigation.** The agent works in a separate checkout (`var/runs/<run>/workspace`). It is given the budget, the changes, known open reports and the environment boundaries, and returns validated JSON with findings, coverage, blockers and cleanup status. Further rounds run while at least 25% of the budget remains and the agent reports that valuable areas remain.
-4. **Fixing.** A finding with a clear, local remedy is fixed on a branch `auto-test/fix-<finding>` that starts at the tested commit. Fixes are never stacked. The runner commits only the files the agent lists, rejects diffs that look like secrets, and permits one correction attempt after an ineffective fix.
+4. **Fixing.** A finding with a clear, local remedy is fixed on a branch `auto-test/fix-<finding>-<run>` that starts at the tested commit. Fixes are never stacked. The runner commits only the files the agent lists, rejects diffs that look like secrets, and permits one correction attempt after an ineffective fix.
 5. **Verification.** A fresh session scrutinizes each finding: a failing reproduction on the baseline, success with the patch, relevant existing checks, and disclosure of pre-existing failures. **The runner does not trust a `verified` claim.** A PR is only published when the result contains a baseline check that observed the bug and a patched check that did not. Each check needs a non-empty evidence file in the run directory.
 6. **Publication** through `gh`, by the runner only:
 
@@ -195,12 +195,12 @@ Rerun after repairing tools, credentials or targets, even if `main` is unchanged
 
 - SQLite (`var/state.sqlite3`) holds checkpoints, runs and reports. Large artifacts stay in run directories.
 - The checkpoint advances only for `completed` or `partial` runs, after results are saved. `blocked`, `incomplete` and `interrupted` runs retry on later invocations without a new commit. After 3 unsuccessful runs of one commit, auto-test pauses that commit and reports `repeated run failures` until `main` changes or you use `--force`.
-- Finding identity is the repository plus the agent-supplied component and root cause, never the SHA. The identity names the branch (`auto-test/fix-<id>`) and the body marker. Open or pending reports are reused, and agents receive them to avoid rediscovery.
+- Finding identity is the repository plus the agent-supplied component and root cause, never the SHA. The identity names the body marker; branches (`auto-test/fix-<id>-<run>`) also include the run ID so revalidation can publish a new branch without overwriting an earlier push. Open or pending reports are reused, and agents receive them to avoid rediscovery.
 - Before any create, auto-test looks up its own issues and PRs by marker (a consistent listing, not search) and PRs by branch. After an ambiguous create (a timeout or 5xx), it waits an hour and reconciles before creating again.
-- Reports closed by the owner are never reopened. If a finding recurs after its report was closed as completed or merged, it gets a new report that references the old one. If the report was closed as not planned or the PR was closed unmerged, the finding is suppressed. Blocker issues are keyed by capability, and new affected repositories are added by editing the issue.
+- Reports closed by the owner are never reopened. If a finding recurs after its report was closed as completed or merged, it gets a new report that references the old one. If the report was closed as not planned or the PR was closed unmerged, the finding is suppressed. Blocker issues are keyed by capability; changed details and newly affected repositories update the issue.
 - Reworded or root-cause-ambiguous findings can still duplicate occasionally and may need owner review.
 - Publication failures keep the prepared bodies and retry with backoff, honoring GitHub rate limits, without repeating testing.
-- A PR whose patched files changed on `main` before publication is not claimed as verified against the new head. It is fixed and verified again in the next run.
+- A PR whose patched files changed on `main` before publication, or whose tested baseline is no longer an ancestor of `main`, is fixed and verified again in the next run.
 - If GitHub is unavailable or unauthenticated, the invocation logs that and skips testing; queued publications wait.
 - A subscription limit defers the remaining repositories that use that provider. An expired login becomes a `<provider> agent setup` blocker.
 

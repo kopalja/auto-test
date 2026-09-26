@@ -58,7 +58,7 @@ use ordinary CLI credential storage and environment variables.
 ./bin/run --config /absolute/path/config.json --once
 ```
 
-Without a mode flag, one cycle is run. Exit codes: 0 for completed/skipped cycles
+Without a mode flag, the runner executes one cycle. Exit codes: 0 for completed/skipped cycles
 or an overlapping invocation; 1 for blocked/incomplete work or configuration
 errors; 130 for interruption. Publication problems remain queued and visible in
 status; they do not invalidate completed testing or its checkpoint.

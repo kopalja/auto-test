@@ -162,6 +162,8 @@ The lifecycle is:
    changes and project behavior. Each records its hypothesis, expected-behavior basis, reproducible
    actions, observations, evidence and recovery. Reusable scripts belong in the evidence directory.
    New rounds stop when fewer than 20% of the shared budget remains or no valuable experiment remains.
+   Stage targets reserve the first 25% for deployment, through 40% for the baseline, and through 80%
+   for exploration. These are soft targets; teardown can finish beyond the budget when necessary.
 4. **Tear down and verify absence.** The verification provider uses the project recipe and run-owned
    resource receipts, then performs inventory checks. Teardown runs even after failed setup, malformed
    agent output, or an empty manifest. `absent=true` alone is insufficient: passing evidence-backed checks
@@ -170,6 +172,8 @@ The lifecycle is:
    independent verification pipeline. Failed experiments alone do not automatically become GitHub issues.
    If a deployed reproduction is needed again, the verifier must recreate it within the same boundaries;
    results against the earlier baseline deployment cannot establish that a patch works.
+   Before fixing or verification can create resources, the runner marks cleanup pending again. A fresh
+   inventory-based teardown follows, including after interruption without a manifest entry.
 
 Every deployment run writes `operational-report.md`, `deployment.json` and an `operational` section in
 `run.json`, including runs with no bugs. The report distinguishes executed experiments from unsupported
@@ -178,8 +182,13 @@ status means testing finished, not that the application passed. Operational succ
 a passing workflow, at least one executed failure/boundary scenario, verified cleanup and no reported
 confidence gaps. Evidence files substantiate agent observations; the runner does not independently prove
 the semantics of every assertion.
+Unsupported experiment evidence stops further exploration and marks the run incomplete, but findings
+already collected still enter verification after teardown succeeds.
 
-Deployment state is persisted before setup. Interrupted teardown is retried on later invocations using
+Authoritative deployment context, contract and stage results live in SQLite; cleanup status also lives
+there. `deployment.json` and `project-contract.md` are exported references, refreshed before each session,
+never read back as authority for targets or cleanup decisions. Deployment state is persisted before setup.
+Interrupted teardown is retried on later invocations using
 the original environment boundaries, pinned commit and contract, even if repository configuration changes
 or monitoring is disabled. After three unsuccessful cleanup attempts it needs operator intervention,
 as with existing resource cleanup. New deployments for that repository wait while teardown is unresolved.
@@ -257,6 +266,8 @@ Rerun after repairing tools, credentials or targets, even if `main` is unchanged
 ### State, deduplication and retries
 
 - SQLite (`var/state.sqlite3`) holds checkpoints, runs and reports. Large artifacts stay in run directories.
+- Checkpoints include the testing mode independently of retained run artifacts. Databases created before
+  mode persistence are migrated automatically; checkpoints with an unknown mode are tested once again.
 - The checkpoint advances only for `completed` or `partial` runs, after results are saved. `blocked`, `incomplete` and `interrupted` runs retry on later invocations without a new commit. After 3 unsuccessful runs of one commit, auto-test pauses that commit and reports `repeated run failures` until `main` changes or you use `--force`.
 - Finding identity is the repository plus the agent-supplied component and root cause, never the SHA. The identity names the body marker; branches (`auto-test/fix-<id>-<run>`) also include the run ID so revalidation can publish a new branch without overwriting an earlier push. Open or pending reports are reused, and agents receive them to avoid rediscovery.
 - Before any create, auto-test looks up its own issues and PRs by marker (a consistent listing, not search) and PRs by branch. After an ambiguous create (a timeout or 5xx), it waits an hour and reconciles before creating again.

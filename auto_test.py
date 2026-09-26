@@ -323,6 +323,7 @@ class Run:
     incomplete: bool = False
     investigate: bool = True
     teardown_attempted: bool = False
+    operational: dict = None
 
     @property
     def workspace(self):
@@ -403,7 +404,7 @@ class Runner:
     def process(self, repo, force=False):
         name = repo['name']
         if repo.get('mode') == 'deployment' and any(
-                row['repo'] == name and deployment.pending(Path(row['directory']))
+                row['repo'] == name and row['deployment'] is not None
                 for row in self.state.cleanup_problems()):
             LOG.warning('Repository %s: deployment blocked until previous teardown is resolved', name)
             return 'blocked'
@@ -422,13 +423,7 @@ class Runner:
         last = self.state.checkpoint(name)
         investigate = True
         if not force:
-            previous_mode = 'source'
-            if last:
-                previous = self.state.run(last['run_id'])
-                record = Path(previous['directory']) / 'run.json'
-                if record.is_file():
-                    previous_mode = json.loads(record.read_text()).get('mode', 'source')
-            if last and last['sha'] == sha and previous_mode == repo.get('mode', 'source'):
+            if last and last['sha'] == sha and last['mode'] == repo.get('mode', 'source'):
                 if not self.state.reports(('revalidate',), repo=name):
                     LOG.info('Repository %s unchanged at %s: skipped', name, sha[:12])
                     return 'skipped'
@@ -484,37 +479,62 @@ class Runner:
 
     def operational_stage(self, run, stage, name, **extra):
         started = time.time()
+        context = self.context(run, stage, **extra)
+        fraction = {'deployment': 0.25, 'baseline': 0.4, 'exploration': 0.8, 'teardown': 1}[stage]
+        target = run.started + fraction * (run.deadline - run.started)
+        context['budget']['stage_target'] = self.iso(min(run.deadline, max(started, target)))
         try:
-            result = self.stage(run, stage, name, self.context(run, stage, share=0.7, **extra))
+            result = self.stage(run, stage, name, context)
         except (AgentError, Failure, KeyboardInterrupt) as exc:
-            record = deployment.read(run.directory)
-            record['gaps'].append(f'{name} did not finish: {str(exc) or "interrupted"}')
-            deployment.save(run.directory, record)
+            run.operational['gaps'].append(f'{name} did not finish: {str(exc) or "interrupted"}')
+            self.state.save_deployment(run.id, run.operational)
             raise
         run.coverage += result['coverage']
         run.summaries.append(result['summary'])
-        deployment.record_result(run, stage, result, self.evidence_ok, time.time() - started)
+        errors = deployment.record_result(run, stage, result, self.evidence_ok, time.time() - started)
+        if errors:
+            run.incomplete = True
+            result['outcome'] = 'incomplete'
+        self.state.save_deployment(run.id, run.operational)
         return result
 
-    def test_deployment(self, run):
+    def arm_deployment(self, run):
+        if self.state.run(run.id)['cleanup'] in ('none', 'clean'):
+            self.state.arm_deployment_cleanup(run.id)
+            run.teardown_attempted = False
+
+    def export_deployment(self, run):
+        # Recreate presentation copies from runner state before each session. Agents cannot change
+        # authoritative targets, contract, cleanup status or earlier results by editing these files.
+        deployment.export(run.directory, {**run.operational, 'cleanup': self.state.run(run.id)['cleanup']})
+        contract = run.directory / 'project-contract.md'
+        temporary = contract.with_suffix('.tmp')
+        temporary.write_text(run.operational['contract'])
+        temporary.replace(contract)
+
+    def init_deployment(self, run):
         # Snapshot before any setup: cleanup must also run after a partial or malformed deployment stage.
         contract = run.workspace / 'auto-test.md'
         if contract.is_file() and not contract.is_symlink():
-            (run.directory / 'project-contract.md').write_text(contract.read_text())
+            contract_text = contract.read_text()
         else:
-            (run.directory / 'project-contract.md').write_text(
+            contract_text = (
                 'No auto-test.md supplied. Derive deployment and teardown from pinned project documentation.\n'
                 'Report a deployment blocker if no reproducible recipe can be established.\n')
-        deployment.save(run.directory, {'repository': run.repo, 'commit': run.sha, 'cleanup': 'pending',
-                                        'stages': [], 'gaps': []})
-        self.state.set_cleanup(run.id, 'pending')
+        run.operational = {'repository': run.repo, 'commit': run.sha, 'contract': contract_text,
+                           'stages': [], 'gaps': []}
+        self.state.save_deployment(run.id, run.operational)
+        self.arm_deployment(run)
+
+    def test_deployment(self, run):
+        self.init_deployment(run)
         deployed = self.operational_stage(run, 'deployment', 'deployment')
         if deployed['outcome'] != 'completed' or not deployed['ready']:
             return 'blocked' if deployed['outcome'] == 'blocked' else 'incomplete'
         if not deployed['identity'].strip() or not deployment.passed_checks(deployed):
             raise AgentError('Deployment readiness requires identity and passing evidence-backed checks', 'invalid')
         baseline = self.operational_stage(run, 'baseline', 'baseline')
-        run.incomplete = baseline['outcome'] == 'incomplete'
+        run.incomplete = run.incomplete or baseline['outcome'] == 'incomplete'
         findings = list(baseline['findings'])
         workflow = any(e['kind'] == 'workflow' and e['status'] == 'passed' and e['evidence_verified']
                        for e in baseline['experiments'])
@@ -542,10 +562,11 @@ class Runner:
                 if outcome == 'dropped':
                     self.state.update_report(row['key'], status='dropped', error='Not confirmed again on the new main')
         elif findings:
-            record = deployment.read(run.directory)
-            record['gaps'].append('Findings retained in stage results; verification skipped because teardown '
-                                  'is unresolved. Rerun with --force after cleanup succeeds.')
-            deployment.save(run.directory, record)
+            run.operational['gaps'].append('Findings retained in stage results; verification skipped because '
+                                           'teardown is unresolved. Rerun with --force after cleanup succeeds.')
+            self.state.save_deployment(run.id, run.operational)
+        if not run.teardown_attempted:
+            self.cleanup(run)  # Fixing/verification may have recreated a deployment after initial teardown.
         summary = deployment.report(run, self.state.run(run.id)['cleanup'], self.redact)
         if run.incomplete:
             return 'incomplete'
@@ -557,24 +578,21 @@ class Runner:
         if run.teardown_attempted:
             return False
         run.teardown_attempted = True
-        record = deployment.read(run.directory)
         # Preserve the original target boundaries even after configuration edits or repository removal.
-        run.repo = record['repository']
         try:
+            run.repo = run.operational['repository']
             if not run.workspace.exists():
                 self.git.worktree(run.repo['name'], run.workspace, run.sha)
             result = self.operational_stage(run, 'teardown',
-                                            f'teardown-{self.state.run(run.id)["cleanup_attempts"] + 1}',
+                                            f'teardown-{len(run.operational["stages"]) + 1}-'
+                                            f'{self.state.run(run.id)["cleanup_attempts"] + 1}',
                                             unresolved_resources=unresolved(run.manifest))
             clean = (result['outcome'] == 'completed' and result['absent']
                      and not result['limitations'] and deployment.passed_checks(result)
                      and not unresolved(run.manifest))
-        except (AgentError, Failure) as exc:
+        except Exception as exc:
             LOG.error('Teardown for %s failed: %s', run.id, exc)
             clean = False
-        record = deployment.read(run.directory)
-        record['cleanup'] = 'clean' if clean else 'pending'
-        deployment.save(run.directory, record)
         attempts = self.state.run(run.id)['cleanup_attempts'] + 1
         self.state.set_cleanup(run.id, 'clean' if clean else ('pending' if attempts < MAX_ATTEMPTS else 'failed'),
                                attempted=True)
@@ -588,6 +606,8 @@ class Runner:
     def test(self, run):
         if run.repo.get('mode') == 'deployment' and run.investigate:
             return self.test_deployment(run)
+        if run.repo.get('mode') == 'deployment':
+            self.init_deployment(run)  # Deferred fix revalidation can deploy resources too.
         name = run.repo['name']
         for row in self.state.reports(('revalidate',), repo=name):
             data = json.loads(row['data'])
@@ -789,6 +809,10 @@ class Runner:
                  cfg['provider'], cfg['model'], cfg['reasoning_effort'])
         try:
             adapter = self.adapter(cfg, env)
+            if run.operational is not None:
+                if stage in ('fixing', 'verification'):
+                    self.arm_deployment(run)
+                self.export_deployment(run)
             result = agents.run_stage(adapter, cfg, stage, agents.prompt(stage, context), workdir or run.workspace,
                                       stage_dir, env, run.directory)
         except AgentError as exc:
@@ -837,7 +861,8 @@ class Runner:
         try:
             if status != 'interrupted':
                 self.cleanup(run)
-            elif unresolved(run.manifest) or deployment.pending(run.directory):
+            elif unresolved(run.manifest) or (run.operational is not None
+                                              and self.state.run(run.id)['cleanup'] != 'clean'):
                 self.state.set_cleanup(run.id, 'pending')  # Bounded shutdown: the next invocation retries.
         except KeyboardInterrupt:
             self.state.set_cleanup(run.id, 'pending')
@@ -854,6 +879,8 @@ class Runner:
                    f'blocked={counts["blocked"]}; reports={len(run.reports)} known={len(run.known)} '
                    f'unpublished={len(run.unpublished)} blockers={len(seen)}')
         cleanup = self.state.run(run.id)['cleanup']
+        if run.operational is not None:
+            self.export_deployment(run)
         operational = deployment.report(run, cleanup, self.redact)
         if operational and cleanup != 'clean' and status in ('completed', 'partial'):
             status = 'partial'
@@ -868,7 +895,7 @@ class Runner:
             'cleanup': cleanup, 'operational': operational}, indent=1))
         self.state.finish_run(run.id, status, summary, error)
         if status in ('completed', 'partial'):
-            self.state.set_checkpoint(name, run.sha, run.id)
+            self.state.set_checkpoint(name, run.sha, run.id, run.repo.get('mode', 'source'))
         for c in run.coverage:
             LOG.info('Coverage %s: %s %s: %s', run.id, c['status'], self.redact(c['area'])[:200],
                      self.redact(c['notes'])[:300])
@@ -878,7 +905,7 @@ class Runner:
 
     def cleanup(self, run):
         """Make sure recorded run-owned resources are gone; ask the agent to remove leftovers once."""
-        if deployment.pending(run.directory):
+        if run.operational is not None and self.state.run(run.id)['cleanup'] != 'clean':
             return self.teardown(run)
         items = unresolved(run.manifest)
         if not items:
@@ -912,10 +939,11 @@ class Runner:
             LOG.warning('Run %s was interrupted; recovering its records', row['id'])
             with contextlib.suppress(Failure):
                 self.git.remove_worktree(row['repo'], Path(row['directory']) / 'workspace')
-            if unresolved(Path(row['directory']) / 'resources.jsonl') or deployment.pending(Path(row['directory'])):
+            if unresolved(Path(row['directory']) / 'resources.jsonl') or (row['deployment'] is not None
+                                                                          and row['cleanup'] != 'clean'):
                 self.state.set_cleanup(row['id'], 'pending')
         for row in self.state.cleanup_problems():
-            if not unresolved(Path(row['directory']) / 'resources.jsonl') and not deployment.pending(Path(row['directory'])):
+            if not unresolved(Path(row['directory']) / 'resources.jsonl') and row['deployment'] is None:
                 self.state.set_cleanup(row['id'], 'clean')
         for row in self.state.cleanup_due(MAX_ATTEMPTS):
             repo = repos.get(row['repo']) or {'name': row['repo'], 'agents': json.loads(row['agents']),
@@ -924,19 +952,28 @@ class Runner:
             run = Run(row['id'], repo, row['sha'], bool(row['forced']), Path(row['directory']), time.time(),
                       time.time() + 600)
             try:
+                if row['deployment'] is not None:
+                    run.operational = json.loads(row['deployment'])
                 self.cleanup(run)
-            except AgentError as exc:
+            except Exception as exc:
                 LOG.error('Cleanup retry for %s failed: %s', row['id'], exc)
+                attempts = self.state.run(run.id)['cleanup_attempts'] + 1
+                self.state.set_cleanup(run.id, 'pending' if attempts < MAX_ATTEMPTS else 'failed', attempted=True)
             finally:
-                if deployment.read(run.directory) is not None:
-                    cleanup = self.state.run(run.id)['cleanup']
-                    operational = deployment.report(run, cleanup, self.redact)
-                    path = run.directory / 'run.json'
-                    if path.is_file():
-                        saved = json.loads(path.read_text())
-                        saved.update(cleanup=cleanup, operational=operational)
-                        path.write_text(json.dumps(saved, indent=1))
-                    self.git.remove_worktree(run.repo['name'], run.workspace)
+                if run.operational is not None:
+                    try:
+                        self.export_deployment(run)
+                        cleanup = self.state.run(run.id)['cleanup']
+                        operational = deployment.report(run, cleanup, self.redact)
+                        path = run.directory / 'run.json'
+                        if path.is_file():
+                            saved = json.loads(path.read_text())
+                            saved.update(cleanup=cleanup, operational=operational)
+                            path.write_text(json.dumps(saved, indent=1))
+                    except Exception as exc:
+                        LOG.error('Could not refresh cleanup report for %s: %s', run.id, exc)
+                    finally:
+                        self.git.remove_worktree(row['repo'], run.workspace)
 
     def retention(self):
         cutoff = time.time() - self.cfg['retention_days'] * 86400

@@ -1,9 +1,10 @@
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
 import auto_test
-import deployment
 from helpers import GOOD_FIX, GOOD_VERIFY, Case, finding
 
 
@@ -214,7 +215,7 @@ class DeploymentTest(Case):
         self.set_plan(**p)
         self.assertEqual(self.run_cli('--once'), 0)
         self.assertEqual([c['stage'] for c in self.calls()],
-                         ['deployment', 'baseline', 'exploration', 'teardown', 'fixing', 'verification'])
+                         ['deployment', 'baseline', 'exploration', 'teardown', 'fixing', 'verification', 'teardown'])
         self.assertEqual(len(self.gh.created('pr')), 1)
 
     def test_blocked_scenario_cannot_disappear_from_confidence_gaps(self):
@@ -260,4 +261,158 @@ class DeploymentTest(Case):
         self.assertIn('service remained healthy', (directory / 'evidence/boundary.txt').read_text())
         self.assertTrue((directory / 'evidence/stopped').exists())
         self.assertFalse(auto_test.unresolved(directory / 'resources.jsonl'))
-        self.assertFalse(deployment.pending(directory))
+        self.assertEqual(self.runs()[0]['cleanup'], 'clean')
+
+    def test_checkpoint_mode_survives_artifact_retention(self):
+        self.run_cli('--once')
+        directory = Path(self.runs()[0]['directory'])
+        self.sql('UPDATE runs SET finished=0')
+        self.run_cli('--once')  # Skip unchanged main, then prune artifacts.
+        self.assertFalse(directory.exists())
+        self.run_cli('--once')
+        self.assertEqual(len(self.calls('deployment')), 1)
+        self.assertEqual(self.state().checkpoint('owner/calc')['mode'], 'deployment')
+        self.run_cli('--once', repositories=[{'name': 'owner/calc', 'mode': 'source'}])
+        self.assertEqual(len(self.calls('investigation')), 1)
+        self.assertEqual(self.state().checkpoint('owner/calc')['mode'], 'source')
+
+    def test_agents_pacing_to_stage_targets_still_explore(self):
+        now = [time.time()]
+        original = auto_test.Runner.stage
+
+        def paced(runner, run, stage, name, context, **kwargs):
+            result = original(runner, run, stage, name, context, **kwargs)
+            if stage in ('deployment', 'baseline', 'exploration'):
+                now[0] = datetime.fromisoformat(context['budget']['stage_target']).timestamp()
+            return result
+
+        with mock.patch.object(auto_test.Runner, 'stage', paced), mock.patch('auto_test.time.time', lambda: now[0]):
+            self.assertEqual(self.run_cli('--once'), 0)
+        self.assertEqual(len(self.calls('exploration')), 1)
+        self.assertEqual(self.record()['operational']['verdict'], 'passed')
+
+    def test_unsupported_experiment_preserves_previous_findings(self):
+        p = plan()
+        p['baseline'][0]['actions'].append({'do': 'repro'})
+        p['baseline'][0]['result']['findings'] = [finding()]
+        p['exploration'][0]['result'].update(experiments=[experiment('boundary', evidence=[])], worth_continuing=True)
+        p['fixing'], p['verification'] = [GOOD_FIX], [GOOD_VERIFY]
+        self.set_plan(**p)
+        self.assertEqual(self.run_cli('--once'), 1)
+        self.assertEqual(len(self.calls('exploration')), 1)
+        self.assertEqual(len(self.gh.created('pr')), 1)
+        self.assertEqual(self.record()['status'], 'incomplete')
+        self.assertFalse(self.record()['operational']['failure_or_boundary_exercised'])
+
+    def test_unsupported_baseline_item_preserves_independent_finding(self):
+        p = plan()
+        p['baseline'][0]['actions'].append({'do': 'repro'})
+        p['baseline'][0]['result'].update(findings=[finding()], experiments=[experiment(evidence=[])])
+        p['fixing'], p['verification'] = [GOOD_FIX], [GOOD_VERIFY]
+        self.set_plan(**p)
+        self.assertEqual(self.run_cli('--once'), 1)
+        self.assertEqual(self.calls('exploration'), [])
+        self.assertEqual(len(self.gh.created('pr')), 1)
+
+    def interrupt_recreated_resource(self, stage):
+        p = plan()
+        p['exploration'][0]['actions'].append({'do': 'repro'})
+        p['exploration'][0]['result']['findings'] = [finding()]
+        p['fixing'], p['verification'] = [GOOD_FIX], [GOOD_VERIFY]
+        p[stage] = [{'actions': [{'do': 'shell', 'cmd':
+            'echo {run_id} > {evidence_directory}/unrecorded-resource'}, {'do': 'signal_parent'}]}]
+        self.set_plan(**p)
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_cli('--once')
+        row = self.runs()[0]
+        directory = Path(row['directory'])
+        self.assertEqual(row['cleanup'], 'pending')
+        self.assertEqual(row['cleanup_attempts'], 0)  # A fresh cleanup phase, not the initial teardown's attempts.
+        self.assertEqual(len(self.calls('teardown')), 1)
+        self.assertEqual(auto_test.unresolved(directory / 'resources.jsonl'), [])
+        self.assertTrue((directory / 'evidence/unrecorded-resource').is_file())
+        p = plan()
+        p['teardown'][0]['actions'].insert(0, {'do': 'shell', 'cmd':
+            'test "$(cat {evidence_directory}/unrecorded-resource)" = "{run_id}" && '
+            'rm {evidence_directory}/unrecorded-resource'})
+        self.set_plan(**p)
+        self.run_cli('--once', repositories=[{'name': 'owner/calc', 'enabled': False}])
+        self.assertFalse((directory / 'evidence/unrecorded-resource').exists())
+        self.assertEqual(self.state().run(row['id'])['cleanup'], 'clean')
+        self.assertEqual(len(self.calls('teardown')), 2)
+        self.assertEqual(self.calls('teardown')[-1]['ctx']['test_environment']['allowed_targets'],
+                         ['original-disposable-target'])
+
+    def test_interrupted_fix_rearms_inventory_even_without_manifest_entry(self):
+        self.interrupt_recreated_resource('fixing')
+
+    def test_interrupted_verification_rearms_inventory_even_without_manifest_entry(self):
+        self.interrupt_recreated_resource('verification')
+
+    def test_deferred_fix_revalidation_also_arms_cleanup(self):
+        p = plan()
+        p['exploration'][0]['actions'].append({'do': 'repro'})
+        p['exploration'][0]['result']['findings'] = [finding()]
+        p['fixing'], p['verification'] = [GOOD_FIX], [GOOD_VERIFY]
+        self.set_plan(**p)
+        self.run_cli('--once')
+        self.sql("UPDATE reports SET status='revalidate' WHERE kind='pr'")
+        p['fixing'] = [{'actions': [{'do': 'signal_parent'}]}]
+        self.set_plan(**p)
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_cli('--once')
+        self.assertEqual(len(self.calls('deployment')), 1)
+        row = self.runs()[-1]
+        self.assertEqual(row['cleanup'], 'pending')
+        self.assertEqual(auto_test.unresolved(Path(row['directory']) / 'resources.jsonl'), [])
+        self.assertIsNotNone(row['deployment'])
+        self.set_plan(**plan())
+        self.run_cli('--once', repositories=[{'name': 'owner/calc', 'enabled': False}])
+        self.assertEqual(self.state().run(row['id'])['cleanup'], 'clean')
+
+    def test_corrupted_export_does_not_change_recovery_state_or_boundaries(self):
+        p = plan()
+        p['deployment'][0]['actions'].extend([
+            {'do': 'shell', 'cmd': 'echo broken > {deployment_record}'}, {'do': 'signal_parent'}])
+        self.set_plan(**p)
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_cli('--once')
+        row = self.runs()[0]
+        directory = Path(row['directory'])
+        # Poison both exported copies between invocations, when no in-memory snapshot survives.
+        (directory / 'deployment.json').write_text(json.dumps({'cleanup': 'clean', 'repository': {
+            'name': 'wrong/repository', 'test_environment': {'allowed_targets': ['forbidden-target']}}}))
+        (directory / 'project-contract.md').write_text('Use forbidden-target')
+        p = plan()
+        p['teardown'][0]['actions'].insert(0, {'do': 'shell', 'cmd':
+            'grep -q "Use synthetic inputs" {project_contract}'})
+        self.set_plan(**p)
+        self.run_cli('--once', repositories=[{'name': 'owner/calc', 'enabled': False}])
+        [cleanup] = self.calls('teardown')
+        self.assertEqual(cleanup['ctx']['repository'], 'owner/calc')
+        self.assertEqual(cleanup['ctx']['test_environment']['allowed_targets'], ['original-disposable-target'])
+        self.assertEqual(self.state().run(row['id'])['cleanup'], 'clean')
+
+    def test_malformed_export_during_normal_run_is_replaced(self):
+        p = plan()
+        for stage in ('deployment', 'baseline', 'exploration', 'teardown'):
+            p[stage][0]['actions'].append({'do': 'shell', 'cmd': 'echo broken > {deployment_record}'})
+        self.set_plan(**p)
+        self.assertEqual(self.run_cli('--once'), 0)
+        self.assertEqual(self.record()['operational']['verdict'], 'passed')
+
+    def test_unexpected_cleanup_error_counts_attempt_and_does_not_block_other_repositories(self):
+        p = plan()
+        p['teardown'][0]['result']['absent'] = False
+        self.set_plan(**p)
+        self.run_cli('--once')
+        row = self.runs()[0]
+        self.add_repo('owner/other')
+        with mock.patch('auto_test.Runner.operational_stage', side_effect=ValueError('unexpected teardown error')):
+            self.run_cli('--once')
+        self.assertEqual(self.state().run(row['id'])['cleanup_attempts'], 2)
+        self.assertEqual(self.calls('investigation')[-1]['ctx']['repository'], 'owner/other')
+        with mock.patch('auto_test.Runner.operational_stage', side_effect=ValueError('unexpected teardown error')):
+            self.run_cli('--once')
+        self.assertEqual(self.state().run(row['id'])['cleanup'], 'failed')
+        self.assertEqual(self.state().run(row['id'])['cleanup_attempts'], 3)

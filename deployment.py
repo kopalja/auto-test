@@ -1,29 +1,18 @@
 """Project-neutral deployment records, evidence checks and local operational reports."""
 import json
 
-from agents import AgentError
 
-
-def read(directory):
-    path = directory / 'deployment.json'
-    return json.loads(path.read_text()) if path.is_file() else None
-
-
-def save(directory, record):
+def export(directory, record):
+    """Agent-readable copy only. Never read it back as runner state."""
     path = directory / 'deployment.json'
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(record, indent=1))
     temporary.replace(path)
 
 
-def pending(directory):
-    record = read(directory)
-    return record is not None and record['cleanup'] != 'clean'
-
-
 def record_result(run, stage, result, evidence_ok, elapsed):
     """Persist even unsupported claims, but never count them as executed experiments."""
-    record = read(run.directory)
+    record = run.operational
     errors = []
     for item in result.get('checks', []) + result.get('experiments', []):
         executed = item['status'] in ('passed', 'failed')
@@ -43,9 +32,7 @@ def record_result(run, stage, result, evidence_ok, elapsed):
             errors.append(f'{stage}: {item["name"] or "unnamed check"} lacks executable evidence')
     record['stages'].append({'stage': stage, 'seconds': round(elapsed, 1), 'result': result})
     record['gaps'].extend(errors)
-    save(run.directory, record)
-    if errors:
-        raise AgentError('; '.join(errors), 'invalid')
+    return errors
 
 
 def passed_checks(result):
@@ -58,7 +45,7 @@ def experiments(record):
 
 
 def report(run, cleanup, redact):
-    record = read(run.directory)
+    record = run.operational
     if record is None:
         return None
     items = experiments(record)

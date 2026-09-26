@@ -53,6 +53,13 @@ class ConfigTest(Case):
         cfg = self.load(repositories=[{'name': 'owner/calc', 'enabled': False}])
         self.assertEqual((cfg['repositories'], cfg['disabled']), ([], ['owner/calc']))
 
+    def test_deployment_mode_is_opt_in(self):
+        self.assertEqual(self.load()['repositories'][0]['mode'], 'source')
+        cfg = self.load(repositories=[{'name': 'owner/calc', 'mode': 'deployment'}])
+        self.assertEqual(cfg['repositories'][0]['mode'], 'deployment')
+        with self.assertRaisesRegex(Failure, 'mode must be'):
+            self.load(repositories=[{'name': 'owner/calc', 'mode': 'invalid'}])
+
     def test_relative_paths_resolve_against_config_file(self):
         cwd = os.getcwd()
         os.chdir('/')

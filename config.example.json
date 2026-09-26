@@ -27,6 +27,7 @@
   "repositories": [
     {
       "name": "owner/example",
+      "mode": "deployment",
       "enabled": true,
       "soft_budget_minutes": 30,
       "instructions": "Use the documented development setup and synthetic test data.",

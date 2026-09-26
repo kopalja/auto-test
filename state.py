@@ -10,13 +10,14 @@ UNSUCCESSFUL = ('blocked', 'incomplete', 'interrupted')
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS checkpoints(
-  repo TEXT PRIMARY KEY, sha TEXT NOT NULL, run_id TEXT NOT NULL, completed REAL NOT NULL);
+  repo TEXT PRIMARY KEY, sha TEXT NOT NULL, run_id TEXT NOT NULL, completed REAL NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'source');
 CREATE TABLE IF NOT EXISTS runs(
   id TEXT PRIMARY KEY, repo TEXT NOT NULL, sha TEXT NOT NULL, forced INTEGER NOT NULL,
   status TEXT NOT NULL, started REAL NOT NULL, finished REAL, agents TEXT NOT NULL,
   directory TEXT NOT NULL, summary TEXT, error TEXT,
   cleanup TEXT NOT NULL DEFAULT 'none', cleanup_attempts INTEGER NOT NULL DEFAULT 0,
-  pruned INTEGER NOT NULL DEFAULT 0);
+  pruned INTEGER NOT NULL DEFAULT 0, deployment TEXT);
 CREATE TABLE IF NOT EXISTS reports(
   key TEXT PRIMARY KEY, base_key TEXT NOT NULL, generation INTEGER NOT NULL, kind TEXT NOT NULL,
   repo TEXT NOT NULL, target TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
@@ -32,6 +33,11 @@ class State:
         self.db = sqlite3.connect(path, timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('PRAGMA journal_mode=WAL;' + SCHEMA)
+        # Old checkpoints have no reliable mode once their artifacts are pruned. Recheck once.
+        for table, column, definition in (('checkpoints', 'mode', "TEXT NOT NULL DEFAULT 'unknown'"),
+                                           ('runs', 'deployment', 'TEXT')):
+            if column not in {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}:
+                self._write(f'ALTER TABLE {table} ADD COLUMN {column} {definition}', ())
 
     def close(self):
         self.db.close()
@@ -44,9 +50,15 @@ class State:
     def checkpoint(self, repo):
         return self.db.execute('SELECT * FROM checkpoints WHERE repo=?', (repo,)).fetchone()
 
-    def set_checkpoint(self, repo, sha, run_id):
-        self._write('INSERT OR REPLACE INTO checkpoints(repo,sha,run_id,completed) VALUES(?,?,?,?)',
-                    (repo, sha, run_id, time.time()))
+    def set_checkpoint(self, repo, sha, run_id, mode='source'):
+        self._write('INSERT OR REPLACE INTO checkpoints(repo,sha,run_id,completed,mode) VALUES(?,?,?,?,?)',
+                    (repo, sha, run_id, time.time(), mode))
+
+    def save_deployment(self, run_id, record):
+        self._write('UPDATE runs SET deployment=? WHERE id=?', (json.dumps(record), run_id))
+
+    def arm_deployment_cleanup(self, run_id):
+        self._write("UPDATE runs SET cleanup='pending',cleanup_attempts=0 WHERE id=?", (run_id,))
 
     # Runs --------------------------------------------------------------------------------
     def start_run(self, run_id, repo, sha, forced, agents, directory):
@@ -93,7 +105,7 @@ class State:
                                "AND cleanup NOT IN ('pending','failed')", (cutoff,)).fetchall()
 
     def mark_pruned(self, run_id):
-        self._write('UPDATE runs SET pruned=1 WHERE id=?', (run_id,))
+        self._write('UPDATE runs SET pruned=1,deployment=NULL WHERE id=?', (run_id,))
 
     # Reports -----------------------------------------------------------------------------
     def report(self, key):

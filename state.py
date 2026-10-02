@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS runs(
   status TEXT NOT NULL, started REAL NOT NULL, finished REAL, agents TEXT NOT NULL,
   directory TEXT NOT NULL, summary TEXT, error TEXT,
   cleanup TEXT NOT NULL DEFAULT 'none', cleanup_attempts INTEGER NOT NULL DEFAULT 0,
-  pruned INTEGER NOT NULL DEFAULT 0, deployment TEXT);
+  pruned INTEGER NOT NULL DEFAULT 0, deployment TEXT, execution_mode TEXT);
 CREATE TABLE IF NOT EXISTS reports(
   key TEXT PRIMARY KEY, base_key TEXT NOT NULL, generation INTEGER NOT NULL, kind TEXT NOT NULL,
   repo TEXT NOT NULL, target TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
@@ -56,7 +56,7 @@ class State:
         self.db.executescript('PRAGMA journal_mode=WAL;' + SCHEMA)
         # Old checkpoints have no reliable mode once their artifacts are pruned. Recheck once.
         for table, column, definition in (('checkpoints', 'mode', "TEXT NOT NULL DEFAULT 'unknown'"),
-                                           ('runs', 'deployment', 'TEXT')):
+                                           ('runs', 'deployment', 'TEXT'), ('runs', 'execution_mode', 'TEXT')):
             if column not in {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}:
                 self._write(f'ALTER TABLE {table} ADD COLUMN {column} {definition}', ())
 
@@ -82,10 +82,10 @@ class State:
         self._write("UPDATE runs SET cleanup='pending',cleanup_attempts=0 WHERE id=?", (run_id,))
 
     # Runs --------------------------------------------------------------------------------
-    def start_run(self, run_id, repo, sha, forced, agents, directory):
-        self._write('INSERT INTO runs(id,repo,sha,forced,status,started,agents,directory) '
-                    'VALUES(?,?,?,?,?,?,?,?)',
-                    (run_id, repo, sha, int(forced), 'running', time.time(), json.dumps(agents), str(directory)))
+    def start_run(self, run_id, repo, sha, forced, agents, directory, execution_mode=None):
+        self._write('INSERT INTO runs(id,repo,sha,forced,status,started,agents,directory,execution_mode) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (run_id, repo, sha, int(forced), 'running', time.time(), json.dumps(agents), str(directory), execution_mode))
 
     def finish_run(self, run_id, status, summary, error=None):
         self._write('UPDATE runs SET status=?,summary=?,error=?,finished=? WHERE id=?',
@@ -225,6 +225,9 @@ class State:
                     'origin_commit,review) VALUES(?,?,?,?,?,?,?,?,?,?)',
                     (repo, manifest['id'], manifest['version'], content_hash, json.dumps(manifest),
                      'candidate', str(bundle), run_id, commit, json.dumps(review) if review else None))
+        if review is not None:
+            self._write('UPDATE scenarios SET review=? WHERE repo=? AND id=? AND version=?',
+                        (json.dumps(review), repo, manifest['id'], manifest['version']))
 
     def catalog(self, repo, states=('candidate', 'active', 'quarantined')):
         return self.db.execute('SELECT * FROM scenarios WHERE repo=? AND state IN (' +
@@ -275,12 +278,16 @@ class State:
 
     def enqueue(self, repo, ident, proposal, priority, commit, run_id, fingerprint, limit=20):
         old = self.db.execute('SELECT * FROM tasks WHERE repo=? AND id=?', (repo, ident)).fetchone()
-        if old:
+        if old and old['status'] in ('pending', 'blocked'):
             # Unrelated commits and repeated agent suggestions cannot reset a paused task.
             if old['fingerprint'] != fingerprint:
                 self._write("UPDATE tasks SET fingerprint=?,attempts=0,next_eligible=0,status='pending',"
                             'proposal=?,updated=? WHERE repo=? AND id=?',
                             (fingerprint, json.dumps(proposal), time.time(), repo, ident))
+            elif proposal.get('scenario_id'):
+                # Retain newly frozen candidate references without resetting open-task backoff.
+                self._write('UPDATE tasks SET proposal=?,updated=? WHERE repo=? AND id=?',
+                            (json.dumps({**json.loads(old['proposal']), **proposal}), time.time(), repo, ident))
             return True
         opened = self.tasks(repo)
         if len(opened) >= limit:
@@ -289,7 +296,7 @@ class State:
                 return False
             self._write("UPDATE tasks SET status='dismissed',blocker='Deferred by backlog limit' WHERE repo=? AND id=?",
                         (repo, lowest['id']))
-        self._write('INSERT INTO tasks(repo,id,proposal,priority,origin_commit,origin_run,status,fingerprint,updated) '
+        self._write('INSERT OR REPLACE INTO tasks(repo,id,proposal,priority,origin_commit,origin_run,status,fingerprint,updated) '
                     'VALUES(?,?,?,?,?,?,\'pending\',?,?)',
                     (repo, ident, json.dumps(proposal), priority, commit, run_id, fingerprint, time.time()))
         return True
@@ -303,7 +310,7 @@ class State:
         return [r for r in self.tasks(repo) if force or (r['attempts'] < retry_cap and r['next_eligible'] <= now)]
 
     def attempt_task(self, repo, ident, done, blocker=None, retry_hours=24, force=False):
-        self._write('UPDATE tasks SET status=?,attempts=CASE WHEN ? THEN 1 ELSE attempts+1 END,'
+        self._write('UPDATE tasks SET status=?,attempts=CASE WHEN ? THEN 0 WHEN ? THEN 1 ELSE attempts+1 END,'
                     'next_eligible=?,blocker=?,updated=? WHERE repo=? AND id=?',
-                    ('done' if done else 'blocked', force, time.time() + retry_hours * 3600,
+                    ('done' if done else 'blocked', done, force, 0 if done else time.time() + retry_hours * 3600,
                      blocker, time.time(), repo, ident))

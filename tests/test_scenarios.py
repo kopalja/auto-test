@@ -84,8 +84,26 @@ class FakeWorker:
         root.mkdir(parents=True, exist_ok=True)
         scenarios.write_files(root, files)
 
-    def copy_out(self, source):
-        return execution.read_tree(Path(self.path(source)), self.profile['artifact_bytes'])
+    def install_bundle(self, files):
+        self.copy_in(files, '/work/bundle')  # Test fake; real permission checks are opt-in Linux tests.
+
+    def service(self, argv, cwd='/work/workspace', env=None):
+        self.record.setdefault('services', []).append(argv)
+
+    def copy_out(self, source, paths=None):
+        root = Path(self.path(source))
+        if paths is None:
+            return execution.read_tree(root, self.profile['artifact_bytes'])
+        result = {}
+        for name in paths:
+            f = root / execution.relative(name)
+            if f.is_symlink():
+                raise Failure('Unsafe export')
+            if f.is_file():
+                result[name] = (f.read_bytes(), bool(f.stat().st_mode & 0o111))
+            elif f.is_dir():
+                result.update({name + '/' + k: v for k, v in execution.read_tree(f, self.profile['artifact_bytes']).items()})
+        return result
 
     def exec(self, argv, cwd='/work/workspace', timeout=None, data='', env=None, agent=False):
         assert not agent, 'Unit replay must never invoke a model'
@@ -229,6 +247,31 @@ class ScenarioTest(unittest.TestCase):
         after['existing_checks']['stdout'] = 'new failure'
         self.assertFalse(scenarios.proof_ok([*before, after], 'o/r', 'base', self.hash, 'fix'))
 
+    def test_recipe_commands_use_profile_timeout_independently_of_scenario(self):
+        m, files = bundle(timeout_seconds=1, prepare_argv=['true'], reset_argv=['true'], version='short')
+        self.path, _ = scenarios.freeze(self.root / 'scenarios', 'o/r', m, files)
+        deployment = {**recipe(), 'setup_argv': ['python3', '-c', 'import time; time.sleep(1.1)'],
+                      'teardown_argv': ['python3', '-c', 'pass']}
+        seen = []
+        original = FakeWorker.exec
+        def execute(worker, argv, **kwargs):
+            seen.append((argv, kwargs['timeout']))
+            return original(worker, argv, **kwargs)
+        with mock.patch.object(FakeWorker, 'exec', execute):
+            result = self.replay.execute(self.path, self.source, 'base', deployment, True)
+        self.assertEqual(result['outcome'], 'failed')
+        for command in result['commands']:
+            timeout = next(seconds for argv, seconds in seen if argv == command['argv'])
+            expected = 1 if command['phase'] in ('prepare', 'assertions', 'reset') else profile()['max_command_seconds']
+            self.assertEqual(timeout, expected)
+
+    def test_recipe_validation_does_not_require_a_proposed_scenario(self):
+        result = self.replay.execute(None, self.source, 'base', recipe())
+        self.assertTrue(result['setup_ok'])
+        self.assertEqual(result['outcome'], 'passed')
+        self.assertIsNone(result['bundle_hash'])
+        self.assertFalse(scenarios.proof_ok([result, result], 'o/r', 'base', self.hash))
+
 
 class BacklogTest(unittest.TestCase):
     def setUp(self):
@@ -263,3 +306,24 @@ class BacklogTest(unittest.TestCase):
         self.assertEqual(self.state.tasks('o/r')[0]['attempts'], 1)
         self.add(fingerprint='changed-profile')
         self.assertEqual(self.state.tasks('o/r')[0]['attempts'], 0)
+
+    def test_success_resets_attempts_and_recurrence_reopens_terminal_tasks(self):
+        self.add()
+        self.state.attempt_task('o/r', 'one', False)
+        self.state.attempt_task('o/r', 'one', True)
+        self.add()
+        [task] = self.state.due_tasks('o/r')
+        self.assertEqual((task['status'], task['attempts']), ('pending', 0))
+        self.state.attempt_task('o/r', 'one', False)
+        self.assertEqual(self.state.tasks('o/r')[0]['attempts'], 1)
+        self.state._write("UPDATE tasks SET status='dismissed' WHERE id='one'")
+        self.add()
+        self.assertEqual(self.state.tasks('o/r')[0]['status'], 'pending')
+
+    def test_reopening_terminal_task_obeys_backlog_limit(self):
+        self.add('old', 30)
+        self.state.attempt_task('o/r', 'old', True)
+        self.add('one', 50)
+        self.add('two', 60)
+        self.assertFalse(self.add('old', 30))
+        self.assertEqual(len(self.state.tasks('o/r')), 2)

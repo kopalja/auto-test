@@ -237,7 +237,12 @@ class Replay:
         self.run_id, self.repo, self.worker_factory = run_id, repo, worker_factory
 
     def execute(self, bundle, source, revision, deployment=None, semantic_approved=False):
-        manifest, files, content_hash = load(bundle, self.profile['artifact_bytes'])
+        if bundle is None:  # Recipe validation is recorded independently of scenario assertions.
+            manifest = dict(id='@setup', version='', requires=[], seed=None, prepare_argv=[], reset_argv=[],
+                            timeout_seconds=self.profile['max_command_seconds'])
+            files, content_hash = {}, None
+        else:
+            manifest, files, content_hash = load(bundle, self.profile['artifact_bytes'])
         known = self.state.db.execute('SELECT hash FROM scenarios WHERE repo=? AND id=? AND version=?',
             (self.repo, manifest['id'], manifest['version'])).fetchone()
         if known and known['hash'] != content_hash:
@@ -254,7 +259,7 @@ class Replay:
                        outcome='inconclusive', cleanup='pending', reset_ok=False,
                        semantic_approved=semantic_approved, commands=[], assertions=None,
                        proposal={k: manifest[k] for k in ('workflow', 'hypothesis', 'expected_basis',
-                                                        'requires', 'assertion_ids', 'reset_argv')},
+                                                        'requires', 'assertion_ids', 'reset_argv') if k in manifest},
                        recipe_hash=sha(canonical(deployment)) if deployment else None)
         # Authoritative proposal and cleanup obligations precede any execution.
         self.state.save_execution(receipt)
@@ -266,7 +271,8 @@ class Replay:
                'AUTO_TEST_BUNDLE': '/work/bundle', 'PYTHONPATH': '/work/workspace'}
 
         def run(a, label):
-            result = worker.exec(a, timeout=timeout, env=env)
+            seconds = timeout if label in ('prepare', 'assertions', 'reset') else self.profile['max_command_seconds']
+            result = worker.exec(a, timeout=seconds, env=env)
             receipt['commands'].append({'phase': label, **result})
             self.state.save_execution(receipt)
             return result
@@ -283,7 +289,8 @@ class Replay:
             start_attempted = True
             worker.start(providers=())
             worker.copy_in(source, '/work/workspace')
-            worker.copy_in({**files, 'manifest.json': (canonical(manifest), False)}, '/work/bundle')
+            if bundle is not None:
+                worker.install_bundle({**files, 'manifest.json': (canonical(manifest), False)})
             if deployment:
                 recipe(deployment)
                 if deployment['setup_argv']:
@@ -296,10 +303,14 @@ class Replay:
                     raise Failure('Deployed revision does not match the frozen source revision')
                 receipt['existing_checks'] = run(deployment['checks_argv'], 'existing_checks')
             receipt['deployed_revision'] = revision
+            receipt['setup_ok'] = True
             if manifest['prepare_argv']:
                 success(manifest['prepare_argv'], 'prepare')
-            result = run(manifest['run_argv'], 'assertions')
-            receipt['outcome'], receipt['assertions'] = assertions(result, manifest['assertion_ids'])
+            if bundle is None:
+                receipt['outcome'] = 'passed'
+            else:
+                result = run(manifest['run_argv'], 'assertions')
+                receipt['outcome'], receipt['assertions'] = assertions(result, manifest['assertion_ids'])
         except (Failure, OSError, ValueError) as exc:
             receipt['error'] = str(exc)
         except BaseException:

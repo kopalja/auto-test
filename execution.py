@@ -210,7 +210,13 @@ READ_FILES = r'''
 import base64,json,pathlib,stat,sys
 p=json.load(sys.stdin); root=pathlib.Path(p['root']); files={}; size=0
 if root.is_symlink(): raise ValueError('symlink root')
-for f in sorted(root.rglob('*')):
+selected=[]
+for name in p['paths']:
+    f=root/name
+    if any(part.is_symlink() for part in [f,*f.parents] if part == root or root in part.parents): raise ValueError('symlink path')
+    if not f.exists(): continue
+    selected.extend(f.rglob('*') if f.is_dir() else [f])
+for f in sorted(set(selected)):
     rel=f.relative_to(root)
     if '.git' in rel.parts: continue
     mode=f.lstat().st_mode
@@ -259,7 +265,7 @@ class DockerWorker:
                 '--user', f'{p["uid"]}:{p["uid"]}', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
                 '--network', p['network'], '--cpus', str(p['cpus']), '--memory', f'{p["memory_mb"]}m',
                 '--memory-swap', f'{p["memory_mb"]}m', '--pids-limit', str(p['pids']),
-                '--tmpfs', f'/work:rw,nosuid,nodev,size={p["storage_mb"]}m,uid={p["uid"]},gid={p["uid"]},mode=700',
+                '--tmpfs', f'/work:rw,nosuid,nodev,size={p["storage_mb"]}m,uid=0,gid=0,mode=1777',
                 '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777', '--shm-size', '16m',
                 '--log-driver', 'none', '--entrypoint', 'python3', p['image'], '-I', '-c',
                 'import time; time.sleep(2147483647)']
@@ -297,7 +303,8 @@ class DockerWorker:
                 or h.get('PidsLimit') != p['pids'] or h.get('NanoCpus') != int(p['cpus'] * 1_000_000_000) \
                 or h.get('CapAdd') or h.get('Devices') or h.get('Binds') \
                 or set(h.get('Tmpfs', {})) != {'/work', '/tmp'} \
-                or f'size={p["storage_mb"]}m' not in h['Tmpfs']['/work']:
+                or any(x not in h['Tmpfs']['/work'] for x in
+                       (f'size={p["storage_mb"]}m', 'uid=0', 'gid=0', 'mode=1777')):
             raise Failure('Worker quotas or mounts differ from the trusted profile')
         return item
 
@@ -337,7 +344,7 @@ class DockerWorker:
         self.persist(self.record)
 
     def copy_in(self, files, destination):
-        if destination not in ('/work', '/work/home', '/work/workspace', '/work/run', '/work/bundle'):
+        if destination not in ('/work', '/work/home', '/work/workspace', '/work/run'):
             raise Failure('Invalid worker transfer destination')
         if sum(len(b) for b, _ in files.values()) > self.profile['artifact_bytes']:
             raise Failure('Transfer exceeds artifact_bytes')
@@ -345,11 +352,27 @@ class DockerWorker:
         self.docker('exec', '-i', self.name, 'python3', '-I', '-c', WRITE_FILES,
                     data=json.dumps({'root': destination, 'files': payload}))
 
-    def copy_out(self, source):
+    def install_bundle(self, files):
+        # Only before application execution in a fresh worker. Root owns the harness;
+        # the sticky, root-owned /work prevents its rename/replacement by the app UID.
+        if sum(len(b) for b, _ in files.values()) > self.profile['artifact_bytes']:
+            raise Failure('Transfer exceeds artifact_bytes')
+        payload = {relative(k): [base64.b64encode(b).decode(), x] for k, (b, x) in files.items()}
+        protect = '''
+root.chmod(0o555)
+for f in root.rglob('*'):
+    f.chmod(0o555 if f.is_dir() or f.stat().st_mode & 0o111 else 0o444)
+'''
+        self.docker('exec', '-i', '--user', '0:0', self.name, 'python3', '-I', '-c', WRITE_FILES + protect,
+                    data=json.dumps({'root': '/work/bundle', 'files': payload}))
+
+    def copy_out(self, source, paths=None):
         if source not in ('/work/workspace', '/work/run'):
             raise Failure('Invalid artifact source')
+        paths = [relative(p) for p in paths] if paths is not None else ['.']
         result = self.docker('exec', '-i', self.name, 'python3', '-I', '-c', READ_FILES,
-                             data=json.dumps({'root': source, 'limit': self.profile['artifact_bytes']}))
+                             data=json.dumps({'root': source, 'paths': paths,
+                                              'limit': self.profile['artifact_bytes']}))
         files = json.loads(result.stdout)
         decoded = {relative(k): (base64.b64decode(v[0], validate=True), bool(v[1])) for k, v in files.items()}
         if sum(len(b) for b, _ in decoded.values()) > self.profile['artifact_bytes']:

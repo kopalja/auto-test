@@ -58,6 +58,9 @@ no host mounts/sockets/namespaces, and the internal network. Docker enforces CPU
 PID and writable-storage limits using cgroup v2. `/work` is size-limited tmpfs; `/tmp` and `/dev/shm`
 each add 16 MiB. Memory includes tmpfs: `memory_mb` must exceed `storage_mb + 32`.
 Unsupported cgroups or image volumes block startup.
+Before application setup, the runner installs replay bundles as root-owned, non-writable
+files under a root-owned sticky `/work` directory. Application processes keep the configured
+non-root UID and cannot overwrite or replace the frozen harness.
 
 Agents get worker-specific HOME and a clean environment: no inherited SSH-agent sockets,
 Docker settings, arbitrary proxies, API billing keys or publisher credentials. Provider
@@ -148,6 +151,8 @@ reset strategy and hashed relative files. Bundles freeze under
 `var/scenarios/<repository-hash>/<id>/<version>/`. Content, executable bits and metadata
 determine the hash; changes need a new version and new proof. Independent semantic review
 checks expectations, observable assertions, duplicates and intentional contract changes.
+Implementation repairs need a new version and semantic review; only changed expectations
+require evidence of an intentional contract change.
 Two consistent fresh executions activate supported scenarios, including failing reproducers.
 Broken/inconsistent scenarios are quarantined with bounded repair tasks. Passing scenarios
 survive retention. Native-test promotion destinations are recorded; system reproducers
@@ -157,6 +162,9 @@ A reviewed recipe records `schema_version`, `setup_argv`, foreground `services`,
 `ready_argv`, `identity_argv`, `teardown_argv`, `checks_argv`, `relevance_paths`. Readiness is
 bounded. Deployment identity queries the running service revision; source-only identity
 may read `AUTO_TEST_REVISION`. Missing/invalidated recipes require setup discovery.
+After rediscovery, retained scenarios replay before new exploration. Recipe commands use
+the profile's `max_command_seconds`; scenario prepare/assertion/reset commands use their
+own `timeout_seconds`, capped by that profile limit.
 Source cwd is `/work/workspace`, bundles `/work/bundle`; `AUTO_TEST_REVISION`,
 `AUTO_TEST_SEED`, `AUTO_TEST_BUNDLE` provide current context, never historical ports/run IDs.
 
@@ -184,6 +192,8 @@ workflow/invariant/trigger, retain higher priorities at the cap and keep attempt
 from checkpoints. Partial runs cannot erase them. Defaults: wait 24 hours, pause after
 three failed attempts; `--repo owner/project --force` resumes. Relevant contract/profile
 changes reset eligibility; unrelated commits do not reset repeated environment failures.
+Successful tasks reset their retry count; recurring failures reopen completed tasks.
+Subscription limits and invalid agent output do not count as local setup failures.
 Status/local reports show tasks, attempts, eligibility, scenario states and named execution.
 No routine backlog/no-findings GitHub posts.
 

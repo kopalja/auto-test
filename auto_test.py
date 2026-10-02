@@ -539,7 +539,8 @@ class Runner:
             if self.state.pending_workers(row['id']):
                 continue
             workers = self.state.db.execute('SELECT 1 FROM workers WHERE run_id=?', (row['id'],)).fetchone()
-            if workers and row['deployment'] is None and not unresolved(Path(row['directory']) / 'resources.jsonl'):
+            if (workers or row['execution_mode'] == 'isolated') and row['deployment'] is None \
+                    and not unresolved(Path(row['directory']) / 'resources.jsonl'):
                 self.state.set_cleanup(row['id'], 'clean')
             else:
                 LOG.error('Run %s needs operator cleanup at its original target; legacy scripts will not run '
@@ -569,7 +570,12 @@ class Runner:
         except Failure as exc:
             self.blocker(name, '', '', 'repository access', 'permissions', str(exc), 'Restore access to main.')
             return 'blocked'
-        source = scenarios.snapshot(self.git, name, sha, profile['artifact_bytes'])
+        try:
+            source = scenarios.snapshot(self.git, name, sha, profile['artifact_bytes'])
+        except (Failure, OSError, ValueError) as exc:
+            self.blocker(name, sha, '', 'source snapshot', 'infrastructure', str(exc),
+                         'Remove unsupported source links/submodules or adjust the worker transfer limit.')
+            return 'blocked'
         contract = source.get('auto-test.md', (b'', False))[0]
         policy_hash = digest(execution.fingerprint(profile) + scenarios.sha(contract), 64)
         revalidate = self.state.reports(('revalidate',), repo=name)
@@ -616,13 +622,14 @@ class Runner:
         started = time.time()
         run = Run(run_id, repo, sha, force, directory, started, started + repo['soft_budget_minutes'] * 60)
         run.evidence.mkdir()
-        self.state.start_run(run_id, name, sha, force, repo['agents'], directory)
+        self.state.start_run(run_id, name, sha, force, repo['agents'], directory, execution_mode='isolated')
         self.state.arm_deployment_cleanup(run_id)
         run.changes_mode, run.changes = self.git.changes(name, last['sha'] if last else None, sha)
         worker = None
         receipts, discovered, replayed, deferred = [], [], [], []
         completed_tasks = set()
         status, error = 'completed', None
+        agent_error = False
         recipe_record = self.state.recipe(name, policy_hash)
         recipe = None
         if recipe_record:
@@ -700,7 +707,69 @@ class Runner:
             self.state.touch_scenario(r)
             if r['cleanup'] != 'clean':
                 raise Failure('Replay cleanup failed; dependent work stopped')
+            if r.get('setup_ok'):
+                completed_tasks.update(t['id'] for t in tasks
+                                       if json.loads(t['proposal'])['workflow'] == 'local setup')
             return r
+
+        def accept_recipe(result, exported):
+            nonlocal recipe, workflow_passed
+            if not result['recipe_path']:
+                if recipe is None:
+                    raise Failure('No validated setup/readiness/identity/existing-check recipe; setup discovery required')
+                replacement = recipe
+            else:
+                relative = execution.relative(result['recipe_path'])
+                if relative not in exported:
+                    raise Failure('Recipe export missing')
+                replacement = scenarios.recipe(json.loads(exported[relative][0]))
+            if repo['mode'] == 'deployment' and not replacement['services']:
+                raise Failure('Local deployment mode requires a foreground service and deployed revision probe')
+            if self.redact.found(json.dumps(replacement)):
+                raise Failure('Recipe contains secret-like content')
+            setup_due = any(t['id'] not in completed_tasks and
+                            json.loads(t['proposal'])['workflow'] == 'local setup' for t in tasks)
+            if replacement != recipe or setup_due:
+                if replacement != recipe:
+                    workflow_passed = repo['mode'] != 'deployment'
+                recipe = replacement
+                r = run_bundle(None, approved=False)
+                if not r.get('setup_ok') or r['outcome'] != 'passed':
+                    raise Failure(r.get('error', 'Recipe setup validation failed'))
+                self.state.save_recipe(name, recipe, sha, policy_hash, validated=True)
+            completed_tasks.update(t['id'] for t in tasks
+                                   if json.loads(t['proposal'])['workflow'] == 'local setup')
+
+        def prior_files(ident):
+            result = []
+            for row in [r for r in catalog if r['id'] == ident][-5:]:
+                try:
+                    files = scenarios.load(Path(row['bundle']))[1]
+                    result.append({'version': row['version'], 'files': {
+                        k: b.decode('utf8', 'replace') for k, (b, _) in files.items()}})
+                except (Failure, OSError) as exc:
+                    result.append({'version': row['version'], 'error': str(exc)})
+            return result
+
+        def replay_retained():
+            nonlocal workflow_passed
+            for row in sorted(ordered, key=lambda r: json.loads(r['metadata'])['kind'] != 'workflow'):
+                if time.time() >= replay_deadline:
+                    break
+                m = json.loads(row['metadata'])
+                if m['kind'] != 'workflow' and not workflow_passed:
+                    continue
+                r = run_bundle(Path(row['bundle']))
+                replayed.append({'id': row['id'], 'version': row['version'], 'outcome': r['outcome']})
+                workflow_passed |= m['kind'] == 'workflow' and r['outcome'] == 'passed'
+                if r['outcome'] != 'passed':
+                    second = run_bundle(Path(row['bundle']))
+                    self.state.scenario_result(name, row['id'], row['version'], [r, second])
+                    failures.append({'scenario': {k: row[k] for k in ('id', 'version', 'metadata', 'reason')},
+                                     'receipts': [r, second]})
+                    queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
+                           'reason': 'Investigate replay failure or repair quarantined scenario',
+                           'requires': m['requires'], 'priority': 80})
 
         try:
             catalog = self.state.catalog(name)
@@ -721,26 +790,26 @@ class Runner:
             replay_deadline = started + repo['soft_budget_minutes'] * 60 * repo['replay_budget_fraction']
             workflow_passed = repo['mode'] != 'deployment'
             failures = []
+            if recipe is None and ordered:
+                setup, exported = session('investigation', {'mode': 'setup', 'catalog': [],
+                    'due_tasks': [], 'replay_failures': []}, agents.DISCOVERY_SCHEMA,
+                    agents.EXPLORATORY_RULES + '\nOnly discover the setup recipe. Return no scenarios or findings. '
+                    'Retained scenarios must replay before new exploration.')
+                run.blockers.extend(setup['blockers'])
+                accept_recipe(setup, exported)
+                # Setup rediscovery must not consume the retained replay allocation.
+                replay_deadline = time.time() + repo['soft_budget_minutes'] * 60 * repo['replay_budget_fraction']
             if recipe:
-                for row in ordered:
-                    if time.time() >= replay_deadline:
-                        break
-                    m = json.loads(row['metadata'])
-                    if m['kind'] != 'workflow' and not workflow_passed:
-                        continue
-                    r = run_bundle(Path(row['bundle']))
-                    replayed.append({'id': row['id'], 'version': row['version'], 'outcome': r['outcome']})
-                    workflow_passed |= m['kind'] == 'workflow' and r['outcome'] == 'passed'
-                    if r['outcome'] != 'passed':
-                        second = run_bundle(Path(row['bundle']))
-                        self.state.scenario_result(name, row['id'], row['version'], [r, second])
-                        failures.append({'scenario': {k: row[k] for k in ('id', 'version', 'metadata', 'reason')},
-                                         'receipts': [r, second]})
-                        queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
-                               'reason': 'Investigate replay failure or repair quarantined scenario',
-                               'requires': m['requires'], 'priority': 80})
+                replay_retained()
             # An unchanged run with replay-only tasks can complete without a model call.
-            replay_only = tasks and all(json.loads(t['proposal']).get('scenario_id') for t in tasks)
+            def task_replayed(task):
+                p = json.loads(task['proposal'])
+                def matches(row):
+                    return row['id'] == p.get('scenario_id') and (
+                        not p.get('version') or row['version'] == p['version'])
+                return any(matches(r) and r['outcome'] == 'passed' for r in replayed) and not any(
+                    matches(r) and r['state'] == 'candidate' for r in catalog)
+            replay_only = tasks and all(task_replayed(t) for t in tasks)
             if time.time() >= run.deadline and not failures:
                 status = 'partial'
             elif unchanged and replay_only and not failures and recipe and replayed and not (force or periodic):
@@ -762,40 +831,49 @@ class Runner:
                     status = result['outcome']
                 for proposal in result['unfinished']:
                     queue(proposal)
-                if result['recipe_path']:
-                    relative = execution.relative(result['recipe_path'])
-                    if relative not in exported:
-                        raise Failure('Recipe export missing')
-                    recipe = scenarios.recipe(json.loads(exported[relative][0]))
-                    if repo['mode'] == 'deployment' and not recipe['services']:
-                        raise Failure('Local deployment mode requires a foreground service and deployed revision probe')
-                    if self.redact.found(json.dumps(recipe)):
-                        raise Failure('Recipe contains secret-like content')
-                    self.state.save_recipe(name, recipe, sha, policy_hash)
-                if recipe is None:
-                    raise Failure('No validated setup/readiness/identity/existing-check recipe; setup discovery required')
+                previous_recipe = recipe
+                accept_recipe(result, exported)
+                if ordered and previous_recipe != recipe:
+                    replay_deadline = time.time() + repo['soft_budget_minutes'] * 60 * repo['replay_budget_fraction']
+                    replay_retained()
                 proposed = []
                 for item in result['scenarios']:
-                    prefix = execution.relative(item['path']) + '/'
-                    files = {k[len(prefix):]: v for k, v in exported.items() if k.startswith(prefix)}
                     try:
+                        prefix = execution.relative(item['path']) + '/'
+                        files = {k[len(prefix):]: v for k, v in exported.items() if k.startswith(prefix)}
                         manifest = json.loads(files.pop('manifest.json')[0])
-                    except (KeyError, ValueError):
-                        raise Failure('Scenario export lacks manifest.json')
-                    path, content_hash = scenarios.freeze(self.state_dir / 'scenarios', name, manifest, files, self.redact)
-                    index = item['finding_index']
-                    if index < -1 or index >= len(result['findings']):
-                        raise Failure('Scenario finding_index is invalid')
+                        index = item['finding_index']
+                        if index < -1 or index >= len(result['findings']):
+                            raise Failure('Scenario finding_index is invalid')
+                        scenarios.validate(manifest, files, profile['artifact_bytes'], self.redact)
+                        path, content_hash = scenarios.freeze(self.state_dir / 'scenarios', name, manifest, files, self.redact)
+                        self.state.add_scenario(name, manifest, content_hash, path, run_id, sha)
+                    except (Failure, KeyError, ValueError) as exc:
+                        run.unpublished.append(f'Scenario {item["path"]}: {exc}')
+                        status = 'partial'
+                        continue
                     proposed.append((manifest, path, content_hash,
                                      result['findings'][index] if index >= 0 else None))
+                # Budget-deferred candidates already have immutable bundles. Resume them
+                # even if discovery does not export a second copy of the same proposal.
+                for task in tasks:
+                    p = json.loads(task['proposal'])
+                    for row in catalog:
+                        if row['state'] != 'candidate' or row['id'] != p.get('scenario_id') \
+                                or (p.get('version') and row['version'] != p['version']) \
+                                or row['hash'] in {v[2] for v in proposed}:
+                            continue
+                        m, _, content_hash = scenarios.load(Path(row['bundle']))
+                        if content_hash != row['hash']:
+                            raise Failure('Retained candidate differs from its catalog hash')
+                        proposed.append((m, Path(row['bundle']), content_hash, p.get('finding')))
                 proposed.sort(key=lambda p: p[0]['kind'] != 'workflow')
-                workflow_passed = repo['mode'] != 'deployment'
                 for manifest, path, content_hash, finding in proposed:
                     m = manifest
                     if time.time() >= run.deadline:
                         queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
                                'reason': 'Budget exhausted before runner replay', 'requires': m['requires'],
-                               'priority': 60, 'scenario_id': m['id']})
+                               'priority': 60, 'scenario_id': m['id'], 'version': m['version'], 'finding': finding})
                         self.state.add_scenario(name, m, content_hash, path, run_id, sha)
                         continue
                     # Independent semantic session gets the frozen proposal and recipe, never model-written proof.
@@ -803,16 +881,19 @@ class Runner:
                     review, _ = session('verification', {'manifest': m, 'recipe': recipe, 'finding': finding,
                         'frozen_files': {k: b.decode('utf8', 'replace') for k, (b, _) in scenarios.load(path)[1].items()},
                         'prior_versions': [{k: r[k] for k in ('id', 'version', 'metadata', 'hash', 'reason')}
-                                           for r in catalog if r['id'] == m['id']][-5:]}, agents.REVIEW_SCHEMA,
+                                           for r in catalog if r['id'] == m['id']][-5:],
+                        'prior_files': prior_files(m['id'])}, agents.REVIEW_SCHEMA,
                         'Review expected behavior against pinned docs/source. Check assertions observe application '
                         'interfaces or independent state; reject echoed claims and unsupported assumptions. Check '
                         'setup/identity/reset and existing checks. This is semantic review, not execution proof. '
                         'In deployment mode identity must query the service; unit-test reruns are not user workflows. '
                         'Identify duplicate workflow/invariant/trigger; replacing expectations needs documented '
-                        'intentional_change_basis. Return only the requested review schema.')
+                        'intentional_change_basis. Set expectations_changed only for a changed behavioral '
+                        'expectation, not import/reset/execution repairs. Compare prior scripts as well as metadata. '
+                        'Return only the requested review schema.')
                     approved = review['supported'] and review['observes_application'] and \
                         review['existing_checks_adequate'] and bool(review['expected_basis'].strip())
-                    if any(r['id'] == m['id'] and r['hash'] != content_hash for r in catalog) \
+                    if review['expectations_changed'] \
                             and not review['intentional_change_basis']:
                         approved = False
                     self.state.add_scenario(name, m, content_hash, path, run_id, sha, review)
@@ -837,7 +918,7 @@ class Runner:
                         workflow_passed |= m['kind'] == 'workflow' and before[-1]['outcome'] == 'passed'
                         for task in tasks:
                             p = json.loads(task['proposal'])
-                            if p['workflow'] == 'local setup' or (p['workflow'] == m['workflow'] and
+                            if (p['workflow'] == m['workflow'] and
                                     p['invariant'] == m['expected_basis'] and p['trigger'] == m['hypothesis']):
                                 completed_tasks.add(task['id'])
                     else:
@@ -863,7 +944,7 @@ class Runner:
                             'Fix the source and add a native regression test. Do not modify the frozen scenario. '
                             'List exact changed files; the runner imports and commits them. Do not publish.')
                         if fix['outcome'] == 'completed' and fix['fixed']:
-                            changes = worker.copy_out('/work/workspace')
+                            changes = worker.copy_out('/work/workspace', fix['files'])
                             stop_worker()
                             self.git.worktree(name, run.workspace, sha)
                             try:
@@ -922,6 +1003,7 @@ class Runner:
             status, error = 'interrupted', 'interrupted'
             raise
         except (Failure, AgentError, OSError, ValueError) as exc:
+            agent_error = isinstance(exc, AgentError) and exc.kind != 'setup'
             if isinstance(exc, AgentError) and exc.kind == 'deferred':
                 self.unusable['subscription'] = exc
             status = 'blocked' if isinstance(exc, AgentError) and exc.kind == 'setup' else 'incomplete'
@@ -930,8 +1012,9 @@ class Runner:
             if isinstance(exc, AgentError) and exc.kind == 'setup':
                 self.blocker(name, sha, run_id, 'worker provider setup', 'credentials', error,
                              'Restore the dedicated worker subscription login/model and run --check-worker.')
-            queue({'workflow': 'local setup', 'invariant': 'worker and recipe usable', 'trigger': 'resume setup',
-                   'reason': error, 'requires': [], 'priority': 100}, error)
+            if not agent_error:
+                queue({'workflow': 'local setup', 'invariant': 'worker and recipe usable', 'trigger': 'resume setup',
+                       'reason': error, 'requires': [], 'priority': 100}, error)
         finally:
             try:
                 stop_worker()
@@ -940,6 +1023,8 @@ class Runner:
             clean = not self.state.pending_workers(run_id)
             self.state.set_cleanup(run_id, 'clean' if clean else 'pending')
             for task in tasks:
+                if agent_error and task['id'] not in completed_tasks:
+                    continue
                 self.state.attempt_task(name, task['id'], task['id'] in completed_tasks,
                     None if task['id'] in completed_tasks else error or 'Concrete proposal remains unfinished',
                     repo['retry_delay_hours'], force=force and task['attempts'] >= repo['retry_cap'])

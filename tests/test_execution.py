@@ -97,7 +97,7 @@ class IsolatedPipelineTest(Case):
                   'recipe_path': 'recipe.json', 'unfinished': [], 'worth_continuing': False}
         review = dict(supported=True, observes_application=True, existing_checks_adequate=True,
                       expected_basis=m['expected_basis'], reason='Documented invariant observed through calc',
-                      duplicate_of=None, intentional_change_basis=None)
+                      duplicate_of=None, expectations_changed=False, intentional_change_basis=None)
         return m, [(result, exported), (review, {})]
 
     def patches(self, responses):
@@ -236,6 +236,36 @@ class IsolatedPipelineTest(Case):
 @unittest.skipUnless(sys.platform == 'linux' and os.environ.get('AUTO_TEST_WORKER_CONFIG'),
                      'Opt-in Linux boundary test: AUTO_TEST_WORKER_CONFIG must designate controlled resources')
 class LinuxBoundaryTest(unittest.TestCase):
+    def test_application_setup_cannot_mutate_or_replace_frozen_bundle(self):
+        import scenarios
+        cfg = auto_test.load_config(os.environ['AUTO_TEST_WORKER_CONFIG'])
+        p = cfg['execution_profiles'][cfg['default_execution_profile']]
+        attack = '''import os,pathlib
+root=pathlib.Path('/work/bundle'); script=root/'check.py'
+replacement=pathlib.Path('/work/replacement.py'); replacement.write_text('raise SystemExit(0)')
+for attack in (lambda: script.write_text('raise SystemExit(0)'),
+               lambda: script.chmod(0o777), lambda: script.unlink(),
+               lambda: root.rename('/work/moved-bundle'),
+               lambda: os.replace(replacement, script), lambda: root.chmod(0o777)):
+    try: attack()
+    except PermissionError: pass
+    else: raise RuntimeError('application mutated the frozen harness')
+assert root.stat().st_uid==0 and script.stat().st_uid==0
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = State(root / 'state.sqlite3')
+            self.addCleanup(state.close)
+            m, files = bundle()
+            path, content_hash = scenarios.freeze(root / 'scenarios', 'fixture/local', m, files)
+            replay = ORIGINAL_REPLAY(state, root / 'receipts', p,
+                                     'integration-' + os.urandom(12).hex(), 'fixture/local')
+            r = replay.execute(path, {'calc.py': (b'def divide(a,b): return a/b\n', False)},
+                               'baseline', {**recipe(), 'setup_argv': ['python3', '-c', attack]}, True)
+            self.assertEqual(r['outcome'], 'failed', r.get('error'))
+            self.assertEqual(r['bundle_hash'], content_hash)
+            self.assertEqual(r['cleanup'], 'clean')
+
     def test_real_filesystem_credentials_network_storage_and_detached_cleanup(self):
         self.assertEqual(auto_test.main(['--config', os.environ['AUTO_TEST_WORKER_CONFIG'], '--check-worker']), 0)
 

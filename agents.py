@@ -295,7 +295,7 @@ DISCOVERY_SCHEMA = _obj(**COMMON, findings=_arr(FINDING), worth_continuing=BOOL,
     unfinished=_arr(_obj(workflow=STR, invariant=STR, trigger=STR, reason=STR,
                         requires=_arr(STR), priority={'type': 'integer'})))
 REVIEW_SCHEMA = _obj(supported=BOOL, observes_application=BOOL, existing_checks_adequate=BOOL,
-    expected_basis=STR, reason=STR, duplicate_of=NSTR, intentional_change_basis=NSTR)
+    expected_basis=STR, reason=STR, duplicate_of=NSTR, expectations_changed=BOOL, intentional_change_basis=NSTR)
 
 
 def worker_adapter(worker, cfg):
@@ -324,7 +324,7 @@ def run_worker_stage(worker, cfg, stage, context, destination, schema=None, inst
                     'evidence/.keep': (b'', False)}, '/work/run')
     args = adapter.command(cfg, Path('/work/workspace'), stage_path, schema, Path('/work/run'))
     receipt = worker.exec(args, agent=True, data=prompt_text)
-    exported = worker.copy_out('/work/run')
+    exported = worker.copy_out('/work/run', [f'stages/{stage_name}'])
     destination.mkdir(parents=True, exist_ok=True)
     prefix = f'stages/{stage_name}/'
     write_files(destination, {k[len(prefix):]: v for k, v in exported.items() if k.startswith(prefix)})
@@ -333,6 +333,11 @@ def run_worker_stage(worker, cfg, stage, context, destination, schema=None, inst
     (destination / 'command.json').write_bytes(canonical(receipt))
     result = validate(adapter.parse(destination, receipt['exit_code']), schema)
     (destination / 'result.json').write_bytes(canonical(result))
+    paths = [item['path'] for item in result.get('scenarios', [])]
+    if result.get('recipe_path'):
+        paths.append(result['recipe_path'])
+    if paths:
+        exported.update(worker.copy_out('/work/run', paths))
     return result, exported
 
 

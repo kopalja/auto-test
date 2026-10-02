@@ -11,9 +11,10 @@ from unittest import mock
 import agents
 import auto_test
 import execution
+import scenarios
 import test_execution as fixtures
 from helpers import Case
-from test_scenarios import bundle, recipe
+from test_scenarios import FakeWorker, bundle, recipe
 
 
 class PipelineReviewTest(Case):
@@ -26,6 +27,125 @@ class PipelineReviewTest(Case):
         result, exported = self.stages(passing=True)[1][0]
         result['scenarios'] = []
         return result, exported
+
+    def test_snapshot_preserves_export_ignored_and_substituted_blobs_and_modes(self):
+        upstream = self.upstreams['owner/calc']
+        (upstream / 'development.py').write_bytes(b'\xff\x00exact bytes\r\n')
+        (upstream / 'development.py').chmod(0o755)
+        (upstream / 'version.txt').write_text('$Format:%H$\n')
+        self.commit('owner/calc', '.gitattributes', 'development.py export-ignore\nversion.txt export-subst\n')
+        repository = auto_test.Git(self.tmp / 'snapshot-repos')
+        revision = repository.fetch_main('owner/calc', str(self.remotes['owner/calc']))
+        files = scenarios.snapshot(repository, 'owner/calc', revision, 8000000)
+        self.assertEqual(files['development.py'], (b'\xff\x00exact bytes\r\n', True))
+        self.assertEqual(files['version.txt'], (b'$Format:%H$\n', False))
+
+    def test_rejected_patch_preserves_confirmed_issue_and_later_scenarios(self):
+        self.configure()
+        _, responses = self.stages()
+        responses[0][0]['findings'][0]['disposition'] = 'fix'
+        m, passing = self.stages(passing=True)
+        m['id'] = 'other'
+        responses[0][0]['scenarios'].append({'path': 'scenarios/other', 'finding_index': -1})
+        responses[0][1].update({k.replace('scenarios/zero/', 'scenarios/other/'): v
+                                for k, v in passing[0][1].items() if k.startswith('scenarios/')})
+        responses[0][1]['scenarios/other/manifest.json'] = (json.dumps(m).encode(), False)
+        from fake_agent import default
+        fix = {**default('fixing'), 'fixed': True, 'files': ['calc.py'], 'regression_tests': []}
+        # The agent claims success but makes no changes; real commit_fix rejects it.
+        responses += [(fix, {}), passing[1]]
+        with self.patches(responses)[0]:
+            self.assertEqual(self.run_real_path('--once'), 0)
+        [report] = self.reports()
+        self.assertEqual((report['kind'], report['status']), ('issue', 'published'))
+        data = json.loads(report['data'])
+        self.assertEqual(len(data['receipt_ids']), 2)
+        self.assertIn('Fix produced no changes', report['body'])
+        self.assertEqual({r['id']: r['state'] for r in self.state().catalog('owner/calc')},
+                         {'zero': 'active', 'other': 'active'})
+        self.assertFalse(self.state().tasks('owner/calc'))
+        self.assertFalse((Path(self.runs()[0]['directory']) / 'workspace').exists())
+
+    def test_unsafe_fix_export_also_falls_back_to_issue(self):
+        self.configure()
+        _, responses = self.stages()
+        responses[0][0]['findings'][0]['disposition'] = 'fix'
+        from fake_agent import default
+        responses.append(({**default('fixing'), 'fixed': True, 'files': ['../escape']}, {}))
+        with self.patches(responses)[0]:
+            self.assertEqual(self.run_real_path('--once'), 0)
+        self.assertEqual(self.reports()[0]['kind'], 'issue')
+        self.assertFalse(self.state().tasks('owner/calc'))
+
+    def test_unexpected_exception_never_checkpoints_and_other_repositories_continue(self):
+        self.configure()
+        self.add_repo('owner/other')
+        responses = [KeyError('runner bug'), *self.stages(passing=True)[1]]
+        with self.patches(responses)[0]:
+            self.assertEqual(self.run_real_path('--once'), 1)
+        self.assertEqual({r['repo']: r['status'] for r in self.runs()},
+                         {'owner/calc': 'incomplete', 'owner/other': 'completed'})
+        self.assertIsNone(self.state().checkpoint('owner/calc'))
+        self.assertIsNotNone(self.state().checkpoint('owner/other'))
+
+    def test_exception_before_worker_setup_records_incomplete(self):
+        self.configure()
+        with mock.patch.object(auto_test.Git, 'changes', side_effect=TypeError('runner bug')):
+            self.assertEqual(self.run_real_path('--once'), 1)
+        self.assertEqual(self.runs()[0]['status'], 'incomplete')
+        self.assertIsNone(self.state().checkpoint('owner/calc'))
+        self.assertFalse(self.state().cleanup_problems())
+
+    def test_missing_recipe_exports_do_not_accumulate_setup_failures(self):
+        self.configure()
+        for _ in range(4):
+            result, exported = self.empty_discovery()
+            exported.pop('recipe.json')
+            with self.patches([(result, exported)])[0]:
+                self.assertEqual(self.run_real_path('--once'), 1)
+        self.assertEqual(len(self.runs()), 4)
+        self.assertFalse(self.state().tasks('owner/calc'))
+
+    def test_repaired_retained_scenario_completes_failure_task_without_agent(self):
+        self.configure()
+        with self.patches(self.stages(passing=True)[1])[0]:
+            self.run_real_path('--once')
+        original = FakeWorker.exec
+        def transient_failure(worker, argv, **kwargs):
+            result = original(worker, argv, **kwargs)
+            if '/work/bundle/check.py' in argv:
+                result.update(exit_code=1, stdout=json.dumps({'passed': [], 'failed': [
+                    {'id': 'zero', 'observation': 'temporary application failure'}]}))
+            return result
+        with self.patches([self.empty_discovery()])[0], mock.patch.object(FakeWorker, 'exec', transient_failure):
+            self.run_real_path('--repo', 'owner/calc', '--force')
+        state = self.state()
+        [task] = state.tasks('owner/calc')
+        proposal = json.loads(task['proposal'])
+        self.assertEqual((proposal['scenario_id'], proposal['version']), ('zero', 'v1'))
+        stack, stage = self.patches([])
+        with stack:
+            self.assertEqual(self.run_real_path('--once'), 0)
+        stage.assert_not_called()
+        self.assertFalse(state.tasks('owner/calc'))
+
+    def test_corrupted_candidate_is_quarantined_without_setup_failure(self):
+        self.configure()
+        with self.patches(self.stages(passing=True)[1])[0]:
+            self.run_real_path('--once')
+        state = self.state()
+        m, files = bundle(id='candidate')
+        path, content_hash = scenarios.freeze(self.tmp / 'var' / 'scenarios', 'owner/calc', m, files)
+        state.add_scenario('owner/calc', m, content_hash, path, 'old', self.head())
+        (path / 'check.py').write_text('changed without a new hash')
+        fingerprint = state.db.execute('SELECT fingerprint FROM recipes').fetchone()[0]
+        state.enqueue('owner/calc', 'candidate', {'workflow': m['workflow'], 'invariant': m['expected_basis'],
+            'trigger': m['hypothesis'], 'reason': 'budget', 'scenario_id': m['id'], 'version': m['version']},
+            60, self.head(), 'old', fingerprint)
+        with self.patches([self.empty_discovery()])[0]:
+            self.assertEqual(self.run_real_path('--once'), 0)
+        self.assertEqual({r['id']: r['state'] for r in state.catalog('owner/calc')}['candidate'], 'quarantined')
+        self.assertFalse(any(json.loads(t['proposal'])['workflow'] == 'local setup' for t in state.tasks('owner/calc')))
 
     def test_source_snapshot_blocker_does_not_abort_other_repositories(self):
         self.configure()
@@ -168,6 +288,24 @@ class PipelineReviewTest(Case):
 
 
 class ExportReviewTest(unittest.TestCase):
+    def test_individual_exports_preserve_combined_artifact_limit(self):
+        result = dict(outcome='completed', summary='ok', coverage=[], blockers=[], cleanup='', overrun_reason=None,
+                      findings=[], worth_continuing=False, scenarios=[{'path': path, 'finding_index': -1}
+                          for path in ('scenarios/one', 'scenarios/two')], recipe_path='', unfinished=[])
+        adapter = mock.Mock()
+        adapter.parse.return_value = result
+        worker = mock.Mock()
+        worker.profile = {'artifact_bytes': 5}
+        worker.exec.return_value = dict(stdout='', stderr='', exit_code=0)
+        worker.copy_out.side_effect = [{}, {'scenarios/one/file': (b'1234', False)},
+                                      {'scenarios/two/file': (b'5678', False)}]
+        with tempfile.TemporaryDirectory() as directory, mock.patch('agents.worker_adapter', return_value=adapter):
+            parsed, exported = agents.run_worker_stage(worker, {}, 'investigation', {}, Path(directory) / 'stage',
+                                                       agents.DISCOVERY_SCHEMA)
+        self.assertEqual(parsed['scenarios'], [{'path': 'scenarios/one', 'finding_index': -1}])
+        self.assertEqual(set(exported), {'scenarios/one/file'})
+        self.assertEqual(parsed['outcome'], 'incomplete')
+
     def test_selected_exports_ignore_dependency_links_and_unrelated_large_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -190,6 +328,7 @@ class ExportReviewTest(unittest.TestCase):
         adapter = mock.Mock()
         adapter.parse.return_value = result
         worker = mock.Mock()
+        worker.profile = {'artifact_bytes': 8000000}
         worker.exec.return_value = dict(stdout='', stderr='', exit_code=0)
         worker.copy_out.return_value = {}
         with tempfile.TemporaryDirectory() as directory, mock.patch('agents.worker_adapter', return_value=adapter):
@@ -197,4 +336,40 @@ class ExportReviewTest(unittest.TestCase):
                                     agents.DISCOVERY_SCHEMA)
         self.assertEqual(worker.copy_out.call_args_list, [
             mock.call('/work/run', ['stages/1-investigation']),
-            mock.call('/work/run', ['scenarios/one', 'recipe.json'])])
+            mock.call('/work/run', ['scenarios/one']), mock.call('/work/run', ['recipe.json'])])
+
+    def test_invalid_scenario_paths_do_not_discard_valid_exports(self):
+        result = dict(outcome='completed', summary='ok', coverage=[], blockers=[], cleanup='', overrun_reason=None,
+                      findings=[], worth_continuing=False, scenarios=[{'path': path, 'finding_index': -1}
+                          for path in ('../escape', '/absolute', 'scenarios/valid')], recipe_path='', unfinished=[])
+        adapter = mock.Mock()
+        adapter.parse.return_value = result
+        worker = mock.Mock()
+        worker.profile = {'artifact_bytes': 8000000}
+        worker.exec.return_value = dict(stdout='', stderr='', exit_code=0)
+        worker.copy_out.return_value = {}
+        with tempfile.TemporaryDirectory() as directory, mock.patch('agents.worker_adapter', return_value=adapter):
+            parsed, _ = agents.run_worker_stage(worker, {}, 'investigation', {}, Path(directory) / 'stage',
+                                                agents.DISCOVERY_SCHEMA)
+        self.assertEqual(parsed['scenarios'], [{'path': 'scenarios/valid', 'finding_index': -1}])
+        self.assertEqual(parsed['outcome'], 'incomplete')
+        self.assertEqual(worker.copy_out.call_count, 2)
+
+
+class SupervisorInputTest(unittest.TestCase):
+    def test_early_exit_with_large_prompt_preserves_status_and_output(self):
+        supervisor = execution.SUPERVISOR
+        if sys.platform != 'linux':
+            # Only the Linux prctl call is disabled; real pipes/threads/child exit are exercised.
+            supervisor = supervisor.replace('ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)', '0')
+        with tempfile.TemporaryDirectory() as directory:
+            payload = dict(argv=[sys.executable, '-c',
+                'import sys; print("subscription exhausted", file=sys.stderr); print("provider output"); sys.exit(7)'],
+                cwd=directory, env={}, limit=10000, timeout=5, input='x' * 2_000_000)
+            result = subprocess.run([sys.executable, '-c', supervisor], input=json.dumps(payload),
+                                    text=True, capture_output=True, timeout=10, check=True)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt['exit_code'], 7)
+        self.assertEqual(receipt['stdout'], 'provider output\n')
+        self.assertIn('subscription exhausted', receipt['stderr'])
+        self.assertNotIn('BrokenPipe', result.stderr)

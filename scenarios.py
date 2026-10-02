@@ -2,7 +2,6 @@
 import hashlib
 import json
 import shutil
-import tarfile
 import tempfile
 import time
 import uuid
@@ -120,34 +119,35 @@ def write_files(root, files):
 def snapshot(git, repo, revision, limit):
     """Export a revision without hooks, helpers, Git metadata or executing project code."""
     listing = git.out('ls-tree', '-rl', '-z', revision, cwd=git.bare(repo))
-    total = 0
+    total, entries = 0, []
     for entry in listing.split('\0'):
         if not entry:
             continue
-        mode, kind, object_id, size = entry.split('\t', 1)[0].split()
+        metadata, name = entry.split('\t', 1)
+        mode, kind, object_id, size = metadata.split()
         if mode == '160000' or kind != 'blob':
             raise Failure('Source submodules are unsupported')
+        if mode not in ('100644', '100755'):
+            raise Failure('Source snapshots containing symlinks need an explicit supported recipe')
+        relative(name)
         total += int(size)
-        if total > limit:
+        if total > limit or len(entries) >= 10000:
             raise Failure('Source snapshot exceeds transfer limit')
-    with tempfile.TemporaryDirectory() as directory:
-        archive = Path(directory) / 'source.tar'
-        git.run('archive', '--format=tar', '-o', archive, revision, cwd=git.bare(repo))
-        if archive.stat().st_size > limit + 2_000_000:
-            raise Failure('Source snapshot exceeds transfer limit')
-        files, total = {}, 0
-        with tarfile.open(archive) as stream:
-            for member in stream:
-                if member.isdir():
-                    continue
-                relative(member.name)
-                if not member.isfile():
-                    raise Failure('Source snapshots containing symlinks/submodules need an explicit supported recipe')
-                total += member.size
-                if total > limit or len(files) >= 10000:
-                    raise Failure('Source snapshot exceeds transfer limit')
-                files[member.name] = (stream.extractfile(member).read(), bool(member.mode & 0o111))
-        return files
+        entries.append((name, mode, object_id, int(size)))
+    # Read exact objects: release-archive attributes must not omit or substitute source.
+    data = git.run('cat-file', '--batch', cwd=git.bare(repo), binary=True,
+                   data=''.join(oid + '\n' for _, _, oid, _ in entries)).stdout
+    files, offset = {}, 0
+    for name, mode, oid, size in entries:
+        end = data.index(b'\n', offset)
+        if data[offset:end] != f'{oid} blob {size}'.encode():
+            raise Failure('Source object does not match the pinned tree')
+        start = end + 1
+        if data[start + size:start + size + 1] != b'\n':
+            raise Failure('Incomplete source object')
+        files[name] = (data[start:start + size], mode == '100755')
+        offset = start + size + 1
+    return files
 
 
 def recipe(value):

@@ -155,10 +155,19 @@ child = subprocess.Popen(p['argv'], cwd=p['cwd'], env=p['env'], start_new_sessio
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 threads = [threading.Thread(target=drain, args=(s,b,i), daemon=True)
            for i,(s,b) in enumerate(((child.stdout,out),(child.stderr,err)))]
-for t in threads: t.start()
-child.stdin.write(p.get('input','').encode()); child.stdin.close()
+def feed():
+    try:
+        child.stdin.write(p.get('input','').encode())
+    except BrokenPipeError:
+        pass  # Early provider exit still needs its output/status classified by the adapter.
+    finally:
+        try: child.stdin.close()
+        except BrokenPipeError: pass
+threads.append(threading.Thread(target=feed, daemon=True))
 timed_out = False
-try: child.wait(timeout=p['timeout'])
+try:
+    for t in threads: t.start()
+    child.wait(timeout=p['timeout'])
 except subprocess.TimeoutExpired: timed_out = True
 finally:
     # Reap/kill every descendant, even children which escaped the original session.

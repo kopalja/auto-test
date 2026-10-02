@@ -311,6 +311,8 @@ def worker_adapter(worker, cfg):
 def run_worker_stage(worker, cfg, stage, context, destination, schema=None, instructions=''):
     """Subscription CLIs run only inside the worker. Host output is a bounded import."""
     from scenarios import canonical, write_files
+    from execution import relative
+    from util import Failure
     schema = schema or SCHEMAS[stage]
     adapter = worker_adapter(worker, cfg)
     stage_name = destination.name
@@ -324,7 +326,10 @@ def run_worker_stage(worker, cfg, stage, context, destination, schema=None, inst
                     'evidence/.keep': (b'', False)}, '/work/run')
     args = adapter.command(cfg, Path('/work/workspace'), stage_path, schema, Path('/work/run'))
     receipt = worker.exec(args, agent=True, data=prompt_text)
-    exported = worker.copy_out('/work/run', [f'stages/{stage_name}'])
+    try:
+        exported = worker.copy_out('/work/run', [f'stages/{stage_name}'])
+    except (Failure, ValueError) as exc:
+        raise AgentError(f'Invalid stage export: {exc}', 'invalid') from exc
     destination.mkdir(parents=True, exist_ok=True)
     prefix = f'stages/{stage_name}/'
     write_files(destination, {k[len(prefix):]: v for k, v in exported.items() if k.startswith(prefix)})
@@ -332,12 +337,28 @@ def run_worker_stage(worker, cfg, stage, context, destination, schema=None, inst
     (destination / 'stderr.log').write_text(receipt['stderr'])
     (destination / 'command.json').write_bytes(canonical(receipt))
     result = validate(adapter.parse(destination, receipt['exit_code']), schema)
-    (destination / 'result.json').write_bytes(canonical(result))
-    paths = [item['path'] for item in result.get('scenarios', [])]
+    def collect(path):
+        files = worker.copy_out('/work/run', [relative(path)])
+        merged = {**exported, **files}
+        if sum(len(data) for data, _ in merged.values()) > worker.profile['artifact_bytes']:
+            raise Failure('Combined stage exports exceed artifact limit')
+        exported.update(files)
+    if 'scenarios' in result:
+        accepted = []
+        for item in result['scenarios']:
+            try:
+                collect(item['path'])
+                accepted.append(item)
+            except (Failure, ValueError) as exc:
+                result['outcome'] = 'incomplete'
+                result['summary'] += f'\nRejected scenario export {item["path"]}: {exc}'
+        result['scenarios'] = accepted
     if result.get('recipe_path'):
-        paths.append(result['recipe_path'])
-    if paths:
-        exported.update(worker.copy_out('/work/run', paths))
+        try:
+            collect(result['recipe_path'])
+        except (Failure, ValueError) as exc:
+            raise AgentError(f'Invalid recipe export: {exc}', 'invalid') from exc
+    (destination / 'result.json').write_bytes(canonical(result))
     return result, exported
 
 

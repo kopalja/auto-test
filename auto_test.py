@@ -202,6 +202,10 @@ def load_config(path):
 
 
 # Runner-owned Git clones --------------------------------------------------------------------
+class WorkerSetupFailure(Failure):
+    """A worker or recipe could not start, rather than invalid agent output."""
+
+
 class MainMissing(Failure):
     pass
 
@@ -218,10 +222,10 @@ class Git:
         self.env.update(GIT_TERMINAL_PROMPT='0', GIT_LFS_SKIP_SMUDGE='1', GIT_CONFIG_NOSYSTEM='1',
                         GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
 
-    def run(self, *args, cwd, timeout=300, network=False, check=True):
+    def run(self, *args, cwd, timeout=300, network=False, check=True, data=None, binary=False):
         argv = [self.git, '-c', f'core.hooksPath={os.devnull}', '-c', 'core.fsmonitor=false',
                 *(self.auth if network else []), *args]
-        return command(argv, cwd=cwd, env=self.env, timeout=timeout, check=check)
+        return command(argv, cwd=cwd, env=self.env, timeout=timeout, check=check, data=data, binary=binary)
 
     def out(self, *args, **kwargs):
         return self.run(*args, **kwargs).stdout
@@ -448,7 +452,12 @@ class Runner:
     # One repository -----------------------------------------------------------------------
     def process(self, repo, force=False):
         if not self.direct_test_executor:
-            return self.process_isolated(repo, force)
+            try:
+                return self.process_isolated(repo, force)
+            except Exception:
+                # Includes failures before run initialization or during finalization.
+                LOG.exception('Repository %s failed unexpectedly', repo['name'])
+                return 'incomplete'
         name = repo['name']
         if repo.get('mode') == 'deployment' and any(
                 row['repo'] == name and row['deployment'] is not None
@@ -623,22 +632,12 @@ class Runner:
         run = Run(run_id, repo, sha, force, directory, started, started + repo['soft_budget_minutes'] * 60)
         run.evidence.mkdir()
         self.state.start_run(run_id, name, sha, force, repo['agents'], directory, execution_mode='isolated')
-        self.state.arm_deployment_cleanup(run_id)
-        run.changes_mode, run.changes = self.git.changes(name, last['sha'] if last else None, sha)
         worker = None
         receipts, discovered, replayed, deferred = [], [], [], []
         completed_tasks = set()
-        status, error = 'completed', None
+        status, error = 'incomplete', None
         agent_error = False
-        recipe_record = self.state.recipe(name, policy_hash)
         recipe = None
-        if recipe_record:
-            candidate = json.loads(recipe_record['recipe'])
-            # Recipe validity follows its declared source paths plus the pinned contract/profile.
-            paths = list(dict.fromkeys(candidate['relevance_paths'] + ['auto-test.md']))
-            if recipe_record['revision'] == sha or (paths and self.git.ancestor(name, recipe_record['revision'], sha)
-                    and not self.git.changed(name, recipe_record['revision'], sha, paths)):
-                recipe = candidate
         replay = scenarios.Replay(self.state, directory / 'receipts', profile, run_id, name)
 
         def queue(proposal, reason=None):
@@ -664,13 +663,16 @@ class Runner:
             if worker is None:
                 worker = execution.DockerWorker(profile, run_id, 'at-' + os.urandom(16).hex(),
                                                 lambda r: self.state.save_worker(run_id, r))
-                worker.start(providers={c['provider'] for c in repo['agents'].values()})
-                worker.copy_in(files or source, '/work/workspace')
+                try:
+                    worker.start(providers={c['provider'] for c in repo['agents'].values()})
+                    worker.copy_in(files or source, '/work/workspace')
+                except (Failure, OSError, ValueError) as exc:
+                    raise WorkerSetupFailure(str(exc)) from exc
                 library, library_context, size = {}, [], 0
                 for row in self.state.catalog(name)[:20]:
                     try:
                         manifest, retained_files, retained_hash = scenarios.load(Path(row['bundle']))
-                    except Failure:
+                    except (Failure, OSError, ValueError):
                         continue  # Metadata still exposes this candidate for repair; never import broken files.
                     if retained_hash != row['hash']:
                         continue
@@ -714,19 +716,22 @@ class Runner:
 
         def accept_recipe(result, exported):
             nonlocal recipe, workflow_passed
-            if not result['recipe_path']:
-                if recipe is None:
-                    raise Failure('No validated setup/readiness/identity/existing-check recipe; setup discovery required')
-                replacement = recipe
-            else:
-                relative = execution.relative(result['recipe_path'])
-                if relative not in exported:
-                    raise Failure('Recipe export missing')
-                replacement = scenarios.recipe(json.loads(exported[relative][0]))
-            if repo['mode'] == 'deployment' and not replacement['services']:
-                raise Failure('Local deployment mode requires a foreground service and deployed revision probe')
-            if self.redact.found(json.dumps(replacement)):
-                raise Failure('Recipe contains secret-like content')
+            try:
+                if not result['recipe_path']:
+                    if recipe is None:
+                        raise Failure('No setup/readiness/identity/existing-check recipe was supplied')
+                    replacement = recipe
+                else:
+                    relative = execution.relative(result['recipe_path'])
+                    if relative not in exported:
+                        raise Failure('Recipe export missing')
+                    replacement = scenarios.recipe(json.loads(exported[relative][0]))
+                if repo['mode'] == 'deployment' and not replacement['services']:
+                    raise Failure('Local deployment mode requires a foreground service and deployed revision probe')
+                if self.redact.found(json.dumps(replacement)):
+                    raise Failure('Recipe contains secret-like content')
+            except (Failure, ValueError, TypeError) as exc:
+                raise AgentError(f'Invalid recipe: {exc}', 'invalid') from exc
             setup_due = any(t['id'] not in completed_tasks and
                             json.loads(t['proposal'])['workflow'] == 'local setup' for t in tasks)
             if replacement != recipe or setup_due:
@@ -735,7 +740,7 @@ class Runner:
                 recipe = replacement
                 r = run_bundle(None, approved=False)
                 if not r.get('setup_ok') or r['outcome'] != 'passed':
-                    raise Failure(r.get('error', 'Recipe setup validation failed'))
+                    raise WorkerSetupFailure(r.get('error', 'Recipe setup validation failed'))
                 self.state.save_recipe(name, recipe, sha, policy_hash, validated=True)
             completed_tasks.update(t['id'] for t in tasks
                                    if json.loads(t['proposal'])['workflow'] == 'local setup')
@@ -762,6 +767,11 @@ class Runner:
                 r = run_bundle(Path(row['bundle']))
                 replayed.append({'id': row['id'], 'version': row['version'], 'outcome': r['outcome']})
                 workflow_passed |= m['kind'] == 'workflow' and r['outcome'] == 'passed'
+                if r['outcome'] == 'passed':
+                    for task in tasks:
+                        p = json.loads(task['proposal'])
+                        if p.get('scenario_id') == row['id'] and p.get('version', row['version']) == row['version']:
+                            completed_tasks.add(task['id'])
                 if r['outcome'] != 'passed':
                     second = run_bundle(Path(row['bundle']))
                     self.state.scenario_result(name, row['id'], row['version'], [r, second])
@@ -769,9 +779,21 @@ class Runner:
                                      'receipts': [r, second]})
                     queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
                            'reason': 'Investigate replay failure or repair quarantined scenario',
-                           'requires': m['requires'], 'priority': 80})
+                           'requires': m['requires'], 'priority': 80,
+                           'scenario_id': row['id'], 'version': row['version']})
 
         try:
+            self.state.arm_deployment_cleanup(run_id)
+            run.changes_mode, run.changes = self.git.changes(name, last['sha'] if last else None, sha)
+            recipe_record = self.state.recipe(name, policy_hash)
+            if recipe_record:
+                candidate = json.loads(recipe_record['recipe'])
+                # Recipe validity follows its declared paths and pinned contract/profile.
+                paths = list(dict.fromkeys(candidate['relevance_paths'] + ['auto-test.md']))
+                if recipe_record['revision'] == sha or (paths and self.git.ancestor(name, recipe_record['revision'], sha)
+                        and not self.git.changed(name, recipe_record['revision'], sha, paths)):
+                    recipe = candidate
+            status = 'completed'
             catalog = self.state.catalog(name)
             seen_scenario_hashes = {r['hash'] for r in catalog}
             changed = self.git.changed(name, last['sha'], sha, []) if last and last['sha'] != sha \
@@ -863,9 +885,16 @@ class Runner:
                                 or (p.get('version') and row['version'] != p['version']) \
                                 or row['hash'] in {v[2] for v in proposed}:
                             continue
-                        m, _, content_hash = scenarios.load(Path(row['bundle']))
-                        if content_hash != row['hash']:
-                            raise Failure('Retained candidate differs from its catalog hash')
+                        try:
+                            m, _, content_hash = scenarios.load(Path(row['bundle']))
+                            if content_hash != row['hash']:
+                                raise Failure('Retained candidate differs from its catalog hash')
+                        except (Failure, OSError, ValueError) as exc:
+                            self.state._write("UPDATE scenarios SET state='quarantined',reason=? "
+                                'WHERE repo=? AND id=? AND version=?', (str(exc), name, row['id'], row['version']))
+                            run.unpublished.append(f'{row["id"]}/{row["version"]}: {exc}')
+                            status = 'partial'
+                            continue
                         proposed.append((m, Path(row['bundle']), content_hash, p.get('finding')))
                 proposed.sort(key=lambda p: p[0]['kind'] != 'workflow')
                 for manifest, path, content_hash, finding in proposed:
@@ -938,51 +967,63 @@ class Runner:
                         known['generation'] if known else 1
                     key = f'{key_base}-{generation}'
                     kind, fix, commit, branch = 'issue', None, None, None
+                    fix_notes = []
                     if finding['disposition'] == 'fix' and time.time() < run.deadline:
-                        fix, _ = session('fixing', {'finding': finding, 'baseline_commit': sha,
-                                                  'frozen_scenario': m}, instructions=
-                            'Fix the source and add a native regression test. Do not modify the frozen scenario. '
-                            'List exact changed files; the runner imports and commits them. Do not publish.')
-                        if fix['outcome'] == 'completed' and fix['fixed']:
-                            changes = worker.copy_out('/work/workspace', fix['files'])
+                        try:
+                            fix, _ = session('fixing', {'finding': finding, 'baseline_commit': sha,
+                                                      'frozen_scenario': m}, instructions=
+                                'Fix the source and add a native regression test. Do not modify the frozen scenario. '
+                                'List exact changed files; the runner imports and commits them. Do not publish.')
+                            if fix['outcome'] == 'completed' and fix['fixed']:
+                                changes = worker.copy_out('/work/workspace', fix['files'])
+                                stop_worker()
+                                try:
+                                    self.git.worktree(name, run.workspace, sha)
+                                    branch = f'auto-test/fix-{key}-{run.id}'
+                                    self.git.prepare(run.workspace, sha, branch)
+                                    for filename in fix['files']:
+                                        execution.relative(filename)
+                                        if filename in changes:
+                                            scenarios.write_files(run.workspace, {filename: changes[filename]})
+                                        elif (run.workspace / filename).is_file():
+                                            (run.workspace / filename).unlink()
+                                    commit = self.git.commit_fix(run.workspace, sha, fix['files'],
+                                        'Fix: ' + finding['title'][:72], self.redact)
+                                finally:
+                                    self.git.remove_worktree(name, run.workspace)
+                                after = run_bundle(path, commit)
+                                patch_review, _ = session('verification', {'mode': 'fix', 'finding': finding,
+                                    'fix': fix, 'fix_commit': commit, 'baseline_commit': sha,
+                                    'runner_receipts': [*before, after]}, instructions=
+                                    'Independently review the patch, documented expectation, and frozen runner receipts. '
+                                    'Report confirmed/effective only if the remedy fixes the cause without weakening '
+                                    'assertions or introducing regressions.', revision=commit,
+                                    files=scenarios.snapshot(self.git, name, commit, profile['artifact_bytes']))
+                                stop_worker()
+                                if patch_review['verdict'] == 'rejected':
+                                    run.unpublished.append(m['id'] + ': ' + patch_review['reason'])
+                                    continue
+                                if scenarios.proof_ok([*before, after], name, sha, content_hash, commit) and \
+                                        patch_review['verdict'] == 'confirmed' and patch_review['fix_verdict'] == 'effective':
+                                    kind = 'pr'
+                                    self.state.link_scenario(name, m['id'], m['version'], key,
+                                        json.dumps(fix['regression_tests']) if fix['regression_tests'] else None)
+                        except (Failure, AgentError, OSError, ValueError) as exc:
+                            fix_notes.append('Optional fix failed: ' + str(exc))
+                            run.unpublished.append(m['id'] + ': ' + fix_notes[-1])
+                            kind, fix, commit, branch = 'issue', None, None, None
+                            if isinstance(exc, AgentError) and exc.kind == 'deferred':
+                                self.unusable['subscription'] = exc
+                        finally:
                             stop_worker()
-                            self.git.worktree(name, run.workspace, sha)
-                            try:
-                                branch = f'auto-test/fix-{key}-{run.id}'
-                                self.git.prepare(run.workspace, sha, branch)
-                                for filename in fix['files']:
-                                    execution.relative(filename)
-                                    if filename in changes:
-                                        scenarios.write_files(run.workspace, {filename: changes[filename]})
-                                    elif (run.workspace / filename).is_file():
-                                        (run.workspace / filename).unlink()
-                                commit = self.git.commit_fix(run.workspace, sha, fix['files'],
-                                    'Fix: ' + finding['title'][:72], self.redact)
-                            finally:
-                                self.git.remove_worktree(name, run.workspace)
-                            after = run_bundle(path, commit)
-                            patch_review, _ = session('verification', {'mode': 'fix', 'finding': finding,
-                                'fix': fix, 'fix_commit': commit, 'baseline_commit': sha,
-                                'runner_receipts': [*before, after]}, instructions=
-                                'Independently review the patch, documented expectation, and frozen runner receipts. '
-                                'Report confirmed/effective only if the remedy fixes the cause without weakening '
-                                'assertions or introducing regressions.', revision=commit,
-                                files=scenarios.snapshot(self.git, name, commit, profile['artifact_bytes']))
-                            stop_worker()
-                            if patch_review['verdict'] == 'rejected':
-                                run.unpublished.append(m['id'] + ': ' + patch_review['reason'])
-                                continue
-                            if scenarios.proof_ok([*before, after], name, sha, content_hash, commit) and \
-                                    patch_review['verdict'] == 'confirmed' and patch_review['fix_verdict'] == 'effective':
-                                kind = 'pr'
-                                self.state.link_scenario(name, m['id'], m['version'], key,
-                                    json.dumps(fix['regression_tests']) if fix['regression_tests'] else None)
+                        if self.state.pending_workers(run_id):
+                            raise Failure('Fix worker cleanup failed; dependent work stopped')
                     verification = {'outcome': 'completed', 'verdict': 'confirmed',
                         'fix_verdict': 'effective' if kind == 'pr' else 'not_applicable', 'checks': [],
                         'summary': review['reason'], 'reason': review['expected_basis'],
                         'preexisting_failures': [c['stdout'][-2000:] + c['stderr'][-2000:]
                             for c in [before[0].get('existing_checks', {})] if c.get('exit_code')],
-                        'limitations': []}
+                        'limitations': fix_notes}
                     proof = [r for r in receipts if r['bundle_hash'] == content_hash and r['revision'] in
                              (sha, commit if kind == 'pr' else sha)]
                     for r in proof:
@@ -1012,9 +1053,12 @@ class Runner:
             if isinstance(exc, AgentError) and exc.kind == 'setup':
                 self.blocker(name, sha, run_id, 'worker provider setup', 'credentials', error,
                              'Restore the dedicated worker subscription login/model and run --check-worker.')
-            if not agent_error:
+            if isinstance(exc, WorkerSetupFailure) or isinstance(exc, AgentError) and exc.kind == 'setup':
                 queue({'workflow': 'local setup', 'invariant': 'worker and recipe usable', 'trigger': 'resume setup',
                        'reason': error, 'requires': [], 'priority': 100}, error)
+        except Exception as exc:
+            status, error = 'incomplete', repr(exc)
+            LOG.exception('Run %s failed unexpectedly', run_id)
         finally:
             try:
                 stop_worker()
@@ -1038,7 +1082,7 @@ class Runner:
             output = dict(id=run_id, repository=name, commit=sha, status=status, error=error, cleanup='clean' if clean else 'pending',
                 replay=replayed, exploration=discovered, deferred=deferred, tasks=[dict(t) for t in self.state.tasks(name)],
                 agent_calls=len(run.stages), new_exploration=new_count, seconds=time.time() - started,
-                stages=run.stages, receipts=[r['id'] for r in receipts])
+                stages=run.stages, receipts=[r['id'] for r in receipts], notes=run.unpublished)
             output['coverage_gaps'] = [] if receipts else ['No runner-executed scenarios in this run']
             (directory / 'run.json').write_text(self.redact(json.dumps(output, indent=2)))
             (directory / 'operational-report.md').write_text(self.redact(

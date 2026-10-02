@@ -328,7 +328,7 @@ class LinuxSupervisorTest(unittest.TestCase):
             parent = ('import subprocess,sys,time,pathlib; subprocess.Popen([sys.executable,"-c",' + repr(child) +
                       '],start_new_session=True)\nwhile not pathlib.Path(' + repr(str(pidfile)) + ').exists(): time.sleep(.01)')
             payload = dict(argv=[sys.executable, '-c', parent], cwd=directory, env={'PATH': os.environ['PATH']},
-                           limit=10000, timeout=3)
+                           limit=10000, timeout=3, input='x' * 2_000_000)
             result = subprocess.run([sys.executable, '-c', execution.SUPERVISOR], input=json.dumps(payload),
                                     text=True, capture_output=True, timeout=10, check=True)
             self.assertEqual(json.loads(result.stdout)['exit_code'], 0)

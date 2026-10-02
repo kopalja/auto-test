@@ -62,7 +62,7 @@ def run_trial(cfg, ident, variant, directory, snapshot=None, review_only=False):
                 worker.stop()
         status = runner.process(repo, force=True)
         runs = state.latest_runs()
-        reports = state.reports(('prepared',))
+        reports = [r for r in state.reports(('prepared',)) if r['kind'] in ('issue', 'pr')]
         executions = state.executions(repo['name'])
         confirmed, control_passes, later_replay = 0, [], []
         # Reuse each discovered frozen reproducer against evaluator-only fixed control source.

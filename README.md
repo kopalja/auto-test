@@ -50,6 +50,8 @@ on the host, even with `--force` or after monitoring/configuration changes.
 Owner checkouts are read-only. The runner fetches pinned `main` and transfers source
 without `.git`, hooks, helpers or host worktree metadata. Only declared regular candidate
 files return to trusted runner checkouts for validation and committing.
+Snapshots copy exact Git blobs and executable modes; release `export-ignore` and
+`export-subst` attributes do not remove tests or rewrite pinned source.
 
 ## Boundary and diagnostics
 
@@ -180,6 +182,8 @@ require semantic confirmation and two fresh baseline failures. PRs also need the
 bundle to pass on a fresh patch, independent patch review, comparable existing checks and
 clean teardown. New check failures block PRs; named pre-existing failures are disclosed.
 Missing proof stays local. Nonempty evidence files cannot authorize publication.
+If an optional fix fails validation, the confirmed baseline finding can still become an
+issue, with the rejected fix recorded as a limitation.
 Deduplication, attribution, independent branches and publication retries remain. No
 speculative issues, automatic merges or unsolicited passing-test-only PRs.
 

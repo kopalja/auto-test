@@ -25,6 +25,27 @@ CREATE TABLE IF NOT EXISTS reports(
   attempts INTEGER NOT NULL DEFAULT 0, next_retry REAL NOT NULL DEFAULT 0, error TEXT,
   run_id TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL, updated REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS reports_base ON reports(base_key, generation);
+CREATE TABLE IF NOT EXISTS workers(
+  name TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS executions(
+  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, repo TEXT NOT NULL, scenario_id TEXT NOT NULL,
+  version TEXT NOT NULL, revision TEXT NOT NULL, outcome TEXT NOT NULL, started REAL NOT NULL,
+  receipt TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS executions_scenario ON executions(repo, scenario_id, version, started);
+CREATE TABLE IF NOT EXISTS scenarios(
+  repo TEXT NOT NULL, id TEXT NOT NULL, version TEXT NOT NULL, hash TEXT NOT NULL, metadata TEXT NOT NULL,
+  state TEXT NOT NULL, bundle TEXT NOT NULL, origin_run TEXT NOT NULL, origin_commit TEXT NOT NULL,
+  last_attempt_commit TEXT, last_pass_commit TEXT, last_fail_commit TEXT, last_execution REAL,
+  finding TEXT, promotion TEXT, reason TEXT, review TEXT,
+  PRIMARY KEY(repo,id,version));
+CREATE TABLE IF NOT EXISTS recipes(
+  repo TEXT PRIMARY KEY, recipe TEXT NOT NULL, revision TEXT NOT NULL, fingerprint TEXT NOT NULL,
+  validated INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS tasks(
+  repo TEXT NOT NULL, id TEXT NOT NULL, proposal TEXT NOT NULL, priority INTEGER NOT NULL,
+  origin_commit TEXT NOT NULL, origin_run TEXT NOT NULL, status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, next_eligible REAL NOT NULL DEFAULT 0,
+  blocker TEXT, fingerprint TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(repo,id));
 '''
 
 
@@ -151,3 +172,138 @@ class State:
 
     def due_reports(self):
         return [r for r in self.reports(DUE) if r['next_retry'] <= time.time()]
+
+    # Isolated execution. These tables are never exported back into authoritative state.
+    def save_worker(self, run_id, record):
+        self._write('INSERT INTO workers VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET '
+                    'status=excluded.status,record=excluded.record',
+                    (record['name'], run_id, record['status'], json.dumps(record)))
+
+    def pending_workers(self, run_id=None):
+        sql = "SELECT * FROM workers WHERE status!='removed'"
+        return self.db.execute(sql + (' AND run_id=?' if run_id else ''),
+                               (run_id,) if run_id else ()).fetchall()
+
+    def save_execution(self, receipt):
+        self._write('INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET '
+                    'outcome=excluded.outcome,receipt=excluded.receipt',
+                    (receipt['id'], receipt['run_id'], receipt['repo'], receipt['scenario_id'],
+                     receipt['version'], receipt['revision'], receipt['outcome'], receipt['started'],
+                     json.dumps(receipt)))
+
+    def prune_execution_outputs(self, run_id):
+        rows = self.db.execute('SELECT receipt FROM executions WHERE run_id=?', (run_id,)).fetchall()
+        for row in rows:
+            receipt = json.loads(row['receipt'])
+            for command in [*receipt.get('commands', []), receipt.get('existing_checks', {})]:
+                for key in ('stdout', 'stderr'):
+                    if key in command:
+                        command[key] = '[pruned; artifact hash retained]'
+            self.save_execution(receipt)
+
+    def executions(self, repo, scenario_id=None, version=None):
+        sql, args = 'SELECT receipt FROM executions WHERE repo=?', [repo]
+        for key, value in (('scenario_id', scenario_id), ('version', version)):
+            if value is not None:
+                sql += f' AND {key}=?'
+                args.append(value)
+        return [json.loads(r[0]) for r in self.db.execute(sql + ' ORDER BY started', args)]
+
+    def proof_receipts(self, ids):
+        if not isinstance(ids, list) or not 2 <= len(ids) <= 10 or len(ids) != len(set(ids)):
+            return []
+        rows = self.db.execute('SELECT receipt FROM executions WHERE id IN (' +
+                               ','.join('?' for _ in ids) + ') ORDER BY started', ids).fetchall()
+        return [json.loads(r[0]) for r in rows] if len(rows) == len(ids) else []
+
+    def add_scenario(self, repo, manifest, content_hash, bundle, run_id, commit, review=None):
+        old = self.db.execute('SELECT hash FROM scenarios WHERE repo=? AND id=? AND version=?',
+                              (repo, manifest['id'], manifest['version'])).fetchone()
+        if old and old['hash'] != content_hash:
+            raise ValueError('Scenario content versions are immutable')
+        self._write('INSERT OR IGNORE INTO scenarios(repo,id,version,hash,metadata,state,bundle,origin_run,'
+                    'origin_commit,review) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    (repo, manifest['id'], manifest['version'], content_hash, json.dumps(manifest),
+                     'candidate', str(bundle), run_id, commit, json.dumps(review) if review else None))
+
+    def catalog(self, repo, states=('candidate', 'active', 'quarantined')):
+        return self.db.execute('SELECT * FROM scenarios WHERE repo=? AND state IN (' +
+                               ','.join('?' for _ in states) + ') ORDER BY COALESCE(last_execution,0),id',
+                               (repo, *states)).fetchall()
+
+    def scenario_result(self, repo, ident, version, receipts):
+        if not receipts:
+            return
+        current = receipts[-1]
+        consistent = len(receipts) >= 2 and len({r['worker'] for r in receipts}) >= 2 and all(
+            r.get('semantic_approved') and r.get('reset_ok') and r.get('cleanup') == 'clean'
+            and r['bundle_hash'] == current['bundle_hash'] and r['revision'] == current['revision']
+            and r['outcome'] == current['outcome'] and
+            {f['id'] for f in (r.get('assertions') or {}).get('failed', [])} ==
+            {f['id'] for f in (current.get('assertions') or {}).get('failed', [])}
+            for r in receipts)
+        state = 'active' if consistent and current['outcome'] in ('passed', 'failed') else 'quarantined'
+        reason = None if state == 'active' else 'Inconsistent or broken replay; bounded repair required'
+        self._write('UPDATE scenarios SET state=?,reason=?,last_attempt_commit=?,last_execution=?,'
+                    'last_pass_commit=CASE WHEN ?=\'passed\' THEN ? ELSE last_pass_commit END,'
+                    'last_fail_commit=CASE WHEN ?=\'failed\' THEN ? ELSE last_fail_commit END '
+                    'WHERE repo=? AND id=? AND version=?',
+                    (state, reason, current['revision'], current['started'], current['outcome'], current['revision'],
+                     current['outcome'], current['revision'], repo, ident, version))
+
+    def touch_scenario(self, receipt):
+        outcome = receipt['outcome']
+        self._write('UPDATE scenarios SET last_attempt_commit=?,last_execution=?,'
+                    'last_pass_commit=CASE WHEN ?=\'passed\' THEN ? ELSE last_pass_commit END,'
+                    'last_fail_commit=CASE WHEN ?=\'failed\' THEN ? ELSE last_fail_commit END '
+                    'WHERE repo=? AND id=? AND version=?',
+                    (receipt['revision'], receipt['started'], outcome, receipt['revision'], outcome,
+                     receipt['revision'], receipt['repo'], receipt['scenario_id'], receipt['version']))
+
+    def link_scenario(self, repo, ident, version, finding=None, promotion=None):
+        self._write('UPDATE scenarios SET finding=COALESCE(?,finding),promotion=COALESCE(?,promotion) '
+                    'WHERE repo=? AND id=? AND version=?', (finding, promotion, repo, ident, version))
+
+    def save_recipe(self, repo, recipe, revision, fingerprint, validated=False):
+        self._write('INSERT OR REPLACE INTO recipes VALUES(?,?,?,?,?)',
+                    (repo, json.dumps(recipe), revision, fingerprint, int(validated)))
+
+    def recipe(self, repo, fingerprint):
+        row = self.db.execute('SELECT * FROM recipes WHERE repo=? AND fingerprint=? AND validated=1',
+                              (repo, fingerprint)).fetchone()
+        return row
+
+    def enqueue(self, repo, ident, proposal, priority, commit, run_id, fingerprint, limit=20):
+        old = self.db.execute('SELECT * FROM tasks WHERE repo=? AND id=?', (repo, ident)).fetchone()
+        if old:
+            # Unrelated commits and repeated agent suggestions cannot reset a paused task.
+            if old['fingerprint'] != fingerprint:
+                self._write("UPDATE tasks SET fingerprint=?,attempts=0,next_eligible=0,status='pending',"
+                            'proposal=?,updated=? WHERE repo=? AND id=?',
+                            (fingerprint, json.dumps(proposal), time.time(), repo, ident))
+            return True
+        opened = self.tasks(repo)
+        if len(opened) >= limit:
+            lowest = min(opened, key=lambda r: (r['priority'], -r['updated']))
+            if lowest['priority'] >= priority:
+                return False
+            self._write("UPDATE tasks SET status='dismissed',blocker='Deferred by backlog limit' WHERE repo=? AND id=?",
+                        (repo, lowest['id']))
+        self._write('INSERT INTO tasks(repo,id,proposal,priority,origin_commit,origin_run,status,fingerprint,updated) '
+                    'VALUES(?,?,?,?,?,?,\'pending\',?,?)',
+                    (repo, ident, json.dumps(proposal), priority, commit, run_id, fingerprint, time.time()))
+        return True
+
+    def tasks(self, repo):
+        return self.db.execute("SELECT * FROM tasks WHERE repo=? AND status IN ('pending','blocked') "
+                               'ORDER BY priority DESC,updated', (repo,)).fetchall()
+
+    def due_tasks(self, repo, retry_cap=3, force=False, now=None):
+        now = time.time() if now is None else now
+        return [r for r in self.tasks(repo) if force or (r['attempts'] < retry_cap and r['next_eligible'] <= now)]
+
+    def attempt_task(self, repo, ident, done, blocker=None, retry_hours=24, force=False):
+        self._write('UPDATE tasks SET status=?,attempts=CASE WHEN ? THEN 1 ELSE attempts+1 END,'
+                    'next_eligible=?,blocker=?,updated=? WHERE repo=? AND id=?',
+                    ('done' if done else 'blocked', force, time.time() + retry_hours * 3600,
+                     blocker, time.time(), repo, ident))

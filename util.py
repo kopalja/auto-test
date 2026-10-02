@@ -28,7 +28,7 @@ def stop(proc, grace=10):
         proc.poll()  # Reap the leader, but wait for surviving group members too.
         try:
             os.killpg(proc.pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             break
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     with contextlib.suppress(ProcessLookupError, PermissionError):

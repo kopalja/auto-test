@@ -1,306 +1,238 @@
 # auto-test
 
-**Nightly, self-hosted bug hunting in selected GitHub repositories with Codex CLI and Claude Code.**
+Exploratory testing with Python, SQLite and installed Codex/Claude subscription CLIs.
+Applications run in disposable Linux Docker workers. The runner retains scenarios,
+replays them across revisions and publishes only independently supported findings.
+No hosted service, automatic merges, provider voting or API-billing fallback.
 
-A small Python standard-library runner. Each night it tests the current `main` of every monitored repository that changed since its last completed run. Coding agents learn the project, form hypotheses, write new tests and experiments, start local services or designated test resources, and reproduce failures. Confirmed bugs with a straightforward, verified fix become pull requests. Other confirmed bugs become issues. Setup problems become issues in this repository. Runs without findings are recorded only in local logs.
+## Migration
 
-The runner owns scheduling, commit selection, state, result validation, publication, deduplication and interruption handling. The agents own the exploratory work. It uses the owner's existing **Codex (ChatGPT)** and **Claude Code** subscription logins and never switches to API billing.
+**A worker execution profile is required.** Old configurations still parse, but missing
+profiles produce a setup blocker before monitored code executes. No host fallback exists
+for startup, authentication or policy failures. Direct execution is injectable only in
+controlled scripted-agent unit tests, never through CLI/configuration.
 
-For operational testing, enable **deployment mode** per repository. It deploys the pinned commit,
-demonstrates a complete user workflow, explores failure or boundary scenarios, then tears down and
-checks resource absence. Project-specific knowledge lives in the monitored repository's `auto-test.md`
-and scripts; the runner has no infrastructure- or application-specific branches.
+Clear legacy `environment_variables`, `allowed_targets` and
+`credential_environment_variables` lists. Use explicit worker credential file references.
+The first backend supports local applications only. Remote Kubernetes/OpenStack/Slurm,
+host Docker sockets, source symlinks and submodules currently produce blockers.
 
-## How a run works
+SQLite migrations preserve runs, reports, checkpoints and cleanup. Published reports
+stay intact; pending legacy findings require fresh runner receipts. Legacy remote cleanup
+requires operator action at its recorded original target. Old cleanup scripts never run
+on the host, even with `--force` or after monitoring/configuration changes.
 
-1. **Discovery.** Every immediate child directory of `monitored-repos/` that has a `.git` entry and a GitHub `origin` is monitored. SSH (`git@github.com:o/r.git`, `ssh://git@github.com/o/r`) and HTTPS origins are accepted and normalized to `owner/repo`. When two checkouts share an origin, the first by name is used. auto-test only reads their origin. It never pulls, resets, cleans or edits them.
-2. **Commit selection.** auto-test fetches `main` into its own bare clone under `var/repos/` and pins the run to that SHA. It then compares the SHA with the last *completed* run (not with dates):
-   - First run: tests the current snapshot.
-   - Unchanged: skipped with no model call.
-   - Changed: the commits and changed files since the checkpoint are given to the agents to prioritize their work, not to limit it.
-   - Rewritten history: investigates the snapshot.
-   - No `main` branch: reported as a blocker. Another branch is never tested instead.
+## Owner setup
 
-   If `main` moves during a run, the run finishes against the pinned SHA.
-3. **Investigation.** In the default `source` mode, the agent works in a separate checkout (`var/runs/<run>/workspace`). It is given the budget, the changes, known open reports and the environment boundaries, and returns validated JSON with findings, coverage, blockers and cleanup status. Further rounds run while at least 25% of the budget remains and the agent reports that valuable areas remain. In `deployment` mode, the lifecycle described below replaces this investigation loop.
-4. **Fixing.** A finding with a clear, local remedy is fixed on a branch `auto-test/fix-<finding>-<run>` that starts at the tested commit. Fixes are never stacked. The runner commits only the files the agent lists, rejects diffs that look like secrets, and permits one correction attempt after an ineffective fix.
-5. **Verification.** A fresh session scrutinizes each finding: a failing reproduction on the baseline, success with the patch, relevant existing checks, and disclosure of pre-existing failures. **The runner does not trust a `verified` claim.** A PR is only published when the result contains a baseline check that observed the bug and a patched check that did not. Each check needs a non-empty evidence file in the run directory.
-6. **Publication** through `gh`, by the runner only:
+1. Supply a dedicated Linux test host (prefer a VM and rootless Docker), immutable image,
+   internal IPv4 Docker bridge, and externally enforced egress gateway. auto-test never
+   installs host packages, changes firewalls, provisions cloud accounts or activates cron.
+2. The image needs Python 3, provider CLIs on `/usr/local/bin:/usr/bin:/bin`, and project
+   dependencies. No secrets, credentials or image-declared `VOLUME`s. Pre-pull it and use
+   `image@sha256:...`. Label the bridge `auto-test.egress-policy=<policy-id>`.
+3. Restrict the gateway to designated provider/dependency destinations. `HTTPS_PROXY`
+   alone is insufficient. Prevent arbitrary CONNECT destinations, DNS tunnels and
+   production access. Keep unrelated services off the bridge: peers and services bound to
+   the host bridge address can be reachable. Enforce host-address restrictions externally too.
+   Egress/DNS policy and credential scoping remain owner responsibilities.
+4. Use supported subscription login in a disposable Linux provisioning environment:
+   `codex login`, or `claude` then `/login`. Reference only dedicated worker auth files,
+   never whole home/config directories. Refresh expired files through the supported flow;
+   there is no OAuth extraction/refresh code. Codex must report ChatGPT login; Claude must
+   report first-party subscription login without an API key source.
+5. Keep GitHub credentials exclusively on the runner. For example:
+   `gh auth login --hostname github.com --git-protocol https --web && gh auth status`.
+   The account needs clone, branch-push, PR/issue and blocker-repository access.
+6. Copy `config.example.json` to `config.json`, replacing model/image/network/credential
+   placeholders. Immediate child Git checkouts under `monitored-repos/` with GitHub
+   origins are discovered. Explicit repository entries never expand discovery.
 
-| Situation | Result |
-| --- | --- |
-| No new commits and no pending work | Logged as skipped; no model call |
-| Completed, no confirmed findings | Local record of what ran (`run.json`, log); nothing on GitHub |
-| Confirmed bug, straightforward verified fix | PR in the monitored repository (never merged) |
-| Confirmed bug needing a decision, more work, or an unverified fix | Issue in the monitored repository with the reproduction |
-| Missing tool, credentials, permissions, test target, infrastructure; unresolved cleanup; repeated failures | Issue in `auto_test_repository` listing the affected repositories |
-| Agent failure, malformed output, interruption | Run marked incomplete/interrupted; retried later; nothing published |
-| Some testing done, some area blocked | Findings published **and** blocker reported; run marked `partial` |
-| Unsupported finding (rejected, or no evidence) | Kept locally only |
+Owner checkouts are read-only. The runner fetches pinned `main` and transfers source
+without `.git`, hooks, helpers or host worktree metadata. Only declared regular candidate
+files return to trusted runner checkouts for validation and committing.
 
-Every body starts with `## 🤖 Generated by Codex` or `## 🤖 Generated by Claude`. The author is the fixing agent's provider for PRs and the investigation provider for issues and blockers. The body lists every stage's provider, model and effort, the tested commit, the run and finding identifiers, and a hidden marker. Model text is escaped and inert: HTML and markers are escaped, `@` mentions are neutralized, and secrets are redacted. The header follows the owner's attribution convention (`## 🤖 Generated by [Codex|Claude]`).
+## Boundary and diagnostics
 
-## Requirements
+Workers use a non-root UID, dropped capabilities, no new privileges, read-only root,
+no host mounts/sockets/namespaces, and the internal network. Docker enforces CPU, memory,
+PID and writable-storage limits using cgroup v2. `/work` is size-limited tmpfs; `/tmp` and `/dev/shm`
+each add 16 MiB. Memory includes tmpfs: `memory_mb` must exceed `storage_mb + 32`.
+Unsupported cgroups or image volumes block startup.
 
-- Linux (the lock uses `fcntl`), run as an **ordinary non-root user**. Claude Code refuses permission bypass as root.
-- Python ≥ 3.9 with the `zoneinfo` timezone database (package `tzdata` on minimal systems). No pip packages.
-- `git`, the GitHub CLI `gh`, and `codex` and/or `claude`. Only the providers selected in the configuration must be installed and logged in.
-- The tools the monitored projects need (compilers, Docker, kubectl, openstack, Slurm clients, browsers, …). auto-test never installs host packages or uses sudo. A missing tool becomes a blocker issue.
+Agents get worker-specific HOME and a clean environment: no inherited SSH-agent sockets,
+Docker settings, arbitrary proxies, API billing keys or publisher credentials. Provider
+credentials are necessarily visible to agents; they are absent from fresh replay workers.
+`provider: "test"` files must hold scoped synthetic local credentials, never production,
+GitHub, SSH or cloud credentials. Owner provisioning is trusted.
 
-## Setup
+Session descendants, including double forks, are reaped. Persistent services start
+separately from reviewed foreground commands. Agent workers are removed before replay;
+baseline and patched states use fresh workers. Worker identities/labels are persisted
+before setup. Recovery removes only recorded labelled workers, including disabled/removed
+repositories. Shared networks remain untouched. Cleanup failures block new deployments.
+Owner-provisioned expiry/TTL is recommended; there is no distributed janitor.
 
-```sh
-git clone https://github.com/kopalja/auto-test.git ~/automations/auto-test && cd ~/automations/auto-test
-```
-
-```sh
-cp config.example.json config.json && vim config.json
-```
-
-Replace the `YOUR_*` model placeholders; placeholder models are rejected. Set `auto_test_repository` to the repository that receives blocker issues. `./bin/run --check` confirms it exists and has issues enabled.
-
-**GitHub.** Log in as the account that should author branches, PRs and issues. A dedicated automation account is recommended.
-
-```sh
-gh auth login --hostname github.com --git-protocol https --web && gh auth status
-```
-
-Git network operations use `gh auth git-credential` over HTTPS (`https://github.com/<owner>/<repo>.git`), so no separate git credentials are needed. `clone_url` overrides the URL per repository (for example an SSH URL). Required access:
-
-- Monitored repositories: contents write (push `auto-test/*` branches), pull requests write, issues write.
-- `auto_test_repository`: issues write.
-
-A fine-grained token (`GH_TOKEN` in the cron environment) can restrict this to the selected repositories.
-
-**Subscription logins** (as the auto-test user):
-
-```sh
-codex login && codex login status
-```
-
-`codex login status` must report "Logged in using ChatGPT". An API-key login is rejected.
-
-```sh
-claude auth status
-```
-
-If Claude is not logged in, run `claude` and then `/login`. On a headless server, `claude setup-token` plus `CLAUDE_CODE_OAUTH_TOKEN` in the cron environment also counts as a subscription login.
-
-The runner never passes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`, `CODEX_API_KEY`, base-URL or Bedrock/Vertex/Foundry switches to agents. It refuses to list them in configuration. It fails the provider's stage when `claude auth status` shows an API-key source, a non-first-party provider or no login. There is no model, provider or billing fallback. The Claude adapter never uses `--bare`, because bare mode ignores subscription OAuth.
-
-**Monitored repositories:**
-
-```sh
-git clone git@github.com:owner/project.git monitored-repos/project
-```
-
-Validate the setup without model calls or infrastructure changes:
+Containers share the Linux kernel and trust the supplied daemon/image/gateway. Canaries
+do not prove freedom from kernel/runtime vulnerabilities or establish production authority.
+See [Docker security](https://docs.docker.com/engine/security/) and
+[storage](https://docs.docker.com/engine/storage/).
 
 ```sh
 ./bin/run --check
+./bin/run --check-worker
+./bin/run --repo owner/project --force --dry-run
+./bin/run --status
+./bin/run --dry-run --status
 ```
 
-`--check` validates the configuration, discovery, the writable state directory, `git`, GitHub login and per-repository access, provider executables and subscription logins, and Codex model/effort pairs against the installed Codex catalog (`codex debug models`). Claude model/effort compatibility can only be proven by a real invocation, so do a dry run before scheduling:
+`--check` is read-only: configuration, discovery, GitHub access and Docker policy/image
+inspection; no workers/models. `--check-worker` explicitly creates workers, verifies
+selected subscription logins without models, tests filesystem/environment/storage/PID/memory
+boundaries and owner-designated canaries, starts a detached service and verifies removal.
+Supply allowed and denied disposable HTTP canaries, including DNS, direct IPv4 and IPv6
+where applicable. Each is tried through the proxy and directly. Any HTTP response from a
+denied target fails, including gateway denial responses; arrange controlled canaries
+accordingly. No production probes. Results are private under `var/diagnostics/`.
 
-```sh
-./bin/run --repo owner/project --dry-run
-```
-
-A dry run does real testing and prepares PR/issue bodies in `var/dry-run/runs/<run>/reports/*.md` without publishing anything. It uses separate state, clones and fix branches under `var/dry-run/`, so it cannot advance production checkpoints or publication records. **It still consumes subscription usage and may create resources in configured test targets.** Rerunning a dry run needs `--force` once its dry-run checkpoint matches `main`.
+Dry runs consume subscription usage and execute applications, but never publish. Separate
+clones, SQLite, scenarios, tasks and checkpoints live under `var/dry-run/`. Use `--force`
+for an intentional repeat when nothing is due.
 
 ## Configuration
 
-`config.json` is read at the start of every invocation, so edits apply to the next run and need no restart. Relative paths are resolved against the configuration file. See `config.example.json`.
+Unknown keys/types/ranges are rejected; paths resolve relative to config. Secrets are
+references, never literal values. Existing global keys retain their meanings:
+`auto_test_repository`, `monitored_directory`, `state_directory`, `timezone`,
+`soft_budget_minutes` (20), `retention_days` (30), `instructions`, `agents`, `repositories`.
+Configure investigation/fixing/verification independently using provider/model/effort;
+repository agent overrides merge by stage. No provider fallback; subscription exhaustion
+defers remaining repositories.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `auto_test_repository` | required | `owner/repo` for blocker issues |
-| `monitored_directory` | `monitored-repos` | Discovery directory (immediate children only) |
-| `state_directory` | `var` | Private state (mode 0700): SQLite, logs, clones, runs |
-| `timezone` | `UTC` | Timestamps in logs and agent budgets (cron has its own timezone, see below) |
-| `soft_budget_minutes` | `20` | Soft budget for a whole repository run |
-| `retention_days` | `30` | Age after which finished run artifacts are deleted |
-| `environment_variables` | `[]` | Extra variable names passed through to every agent |
-| `instructions` | `""` | Instructions for every repository |
-| `agents` | required | `investigation`, `fixing`, `verification`: each `{provider, model, reasoning_effort}` |
-| `repositories` | `[]` | Optional per-repository entries (below) |
+`execution` has `default` and named `profiles`:
 
-Repository entries (`name` is required) override discovered repositories. An entry without a checkout in `monitored-repos/` is ignored; entries never add repositories.
+| Profile field | Meaning/default |
+| --- | --- |
+| `backend`, `image` | `docker`; immutable image digest |
+| `network`, `egress_policy` | Internal bridge and matching owner policy label |
+| `cpus`, `memory_mb`, `pids`, `storage_mb`, `uid` | 2, 2048, 256, 512, 1000 |
+| `max_command_seconds`, `artifact_bytes` | 300; 8,000,000 per transfer/output stream |
+| `credentials` | `{source,target,provider}` files; target relative to worker home; provider codex/claude/test |
+| `proxy_environment` | Explicit HTTP/HTTPS/NO_PROXY variants only |
+| `capabilities` | Owner-supported local capabilities; default `["local"]` |
+| `canaries` | Disposable `{url,allowed}` diagnostics |
 
-- `enabled`: `false` disables the repository. Removing the checkout also works.
-- `mode`: `source` (default, existing investigation workflow) or `deployment` (operational exploration).
-  Changing modes triggers a run even when the current checkpoint's commit is unchanged.
-- `soft_budget_minutes`, `instructions`: `instructions` is appended to the global instructions.
-- `agents`: per-stage partial overrides, for example `{"fixing": {"provider": "codex", "model": "gpt-6-sol"}}`. When switching the provider, also set `model` and `reasoning_effort` for it.
-- `test_environment`: `description`, `allowed_targets` (a list of free-text target descriptions), `credential_environment_variables` (names passed only to this repository's agents) and `instructions`.
-- `clone_url`: Git URL for the runner-owned clone.
+Repository keys include `name`, `enabled`, `mode` (source/deployment), `clone_url`,
+`instructions`, `agents`, `soft_budget_minutes`, `test_environment`, `execution_profile`:
 
-### Deployment mode
+| Scheduling key | Default |
+| --- | --- |
+| `exploration_interval_days` | 0, periodic exploration off |
+| `backlog_limit` | 20 open concrete tasks |
+| `retry_delay_hours`, `retry_cap` | 24 hours, 3 attempts |
+| `replay_budget_fraction` | 0.4 maximum routine allocation |
 
-Set `"mode": "deployment"` in the repository's configuration entry. Add an
-[`auto-test.md` contract](examples/auto-test.md) to the monitored repository describing its deployment,
-readiness probes, critical workflows, recovery expectations, teardown and absence checks. Use existing
-project scripts for repeatable setup; no additional command DSL is required. Without a contract, the
-agent tries the pinned project documentation and reports a blocker if no usable recipe can be established.
-The runner snapshots the contract before setup. Never put credentials in it.
+Contract/profile fingerprints invalidate capability assumptions; relevant source changes
+invalidate setup recipes. Agents/project docs cannot change authority, credentials, limits
+or scheduler state.
 
-Environment targets and credential variable names belong in `test_environment`; put resource limits,
-allowed failure operations and environment constraints in `test_environment.instructions`. These are
-agent instructions, not infrastructure-enforced quotas. Project documentation cannot expand the allowed
-targets. Local disposable services need no cloud target. Detached services must survive the agent's
-process group ending between stages.
+## Scenarios and proof
 
-The lifecycle is:
+Copy `examples/auto-test.md` into a project. Describe important workflows, contracts,
+independent observations, supported faults and reset/teardown. Deployment mode requires
+a passing complete workflow before boundary/fault experiments. Proposals are persisted
+before execution; proposals and agent logs are not coverage.
 
-1. **Deploy and check readiness.** The investigation provider deploys the tested revision and records
-   deployment identity, actual probe commands, outputs and expected/observed results. A readiness claim
-   needs passing checks with non-empty evidence files outside the disposable workspace.
-2. **Demonstrate a baseline workflow.** A separate session exercises a complete user workflow against
-   the running deployment. Readiness probes and existing unit tests do not count. Fault exploration
-   starts only after a workflow passes.
-3. **Explore.** Further sessions derive relevant failure or boundary experiments from the contract,
-   changes and project behavior. Each records its hypothesis, expected-behavior basis, reproducible
-   actions, observations, evidence and recovery. Reusable scripts belong in the evidence directory.
-   New rounds stop when fewer than 20% of the shared budget remains or no valuable experiment remains.
-   Stage targets reserve the first 25% for deployment, through 40% for the baseline, and through 80%
-   for exploration. These are soft targets; teardown can finish beyond the budget when necessary.
-4. **Tear down and verify absence.** The verification provider uses the project recipe and run-owned
-   resource receipts, then performs inventory checks. Teardown runs even after failed setup, malformed
-   agent output, or an empty manifest. `absent=true` alone is insufficient: passing evidence-backed checks
-   and an empty unresolved-resource manifest are required.
-5. **Handle findings.** Once teardown succeeds, confirmed candidate findings enter the existing fix and
-   independent verification pipeline. Failed experiments alone do not automatically become GitHub issues.
-   If a deployed reproduction is needed again, the verifier must recreate it within the same boundaries;
-   results against the earlier baseline deployment cannot establish that a patch works.
-   Before fixing or verification can create resources, the runner marks cleanup pending again. A fresh
-   inventory-based teardown follows, including after interruption without a manifest entry.
+`agents.EXPLORATORY_RULES` and `scenarios.py` define version-1 manifests/scripts: workflow,
+hypothesis, expected basis, capabilities, named assertions, synthetic seed, argv arrays,
+reset strategy and hashed relative files. Bundles freeze under
+`var/scenarios/<repository-hash>/<id>/<version>/`. Content, executable bits and metadata
+determine the hash; changes need a new version and new proof. Independent semantic review
+checks expectations, observable assertions, duplicates and intentional contract changes.
+Two consistent fresh executions activate supported scenarios, including failing reproducers.
+Broken/inconsistent scenarios are quarantined with bounded repair tasks. Passing scenarios
+survive retention. Native-test promotion destinations are recorded; system reproducers
+remain because native tests may cover only part of the invariant.
 
-Every deployment run writes `operational-report.md`, `deployment.json` and an `operational` section in
-`run.json`, including runs with no bugs. The report distinguishes executed experiments from unsupported
-claims and lists untested areas. Its verdict is `passed`, `failed` or `incomplete`; the runner's `completed`
-status means testing finished, not that the application passed. Operational success requires readiness,
-a passing workflow, at least one executed failure/boundary scenario, verified cleanup and no reported
-confidence gaps. Evidence files substantiate agent observations; the runner does not independently prove
-the semantics of every assertion.
-Unsupported experiment evidence stops further exploration and marks the run incomplete, but findings
-already collected still enter verification after teardown succeeds.
+A reviewed recipe records `schema_version`, `setup_argv`, foreground `services`,
+`ready_argv`, `identity_argv`, `teardown_argv`, `checks_argv`, `relevance_paths`. Readiness is
+bounded. Deployment identity queries the running service revision; source-only identity
+may read `AUTO_TEST_REVISION`. Missing/invalidated recipes require setup discovery.
+Source cwd is `/work/workspace`, bundles `/work/bundle`; `AUTO_TEST_REVISION`,
+`AUTO_TEST_SEED`, `AUTO_TEST_BUNDLE` provide current context, never historical ports/run IDs.
 
-Authoritative deployment context, contract and stage results live in SQLite; cleanup status also lives
-there. `deployment.json` and `project-contract.md` are exported references, refreshed before each session,
-never read back as authority for targets or cleanup decisions. Deployment state is persisted before setup.
-Interrupted teardown is retried on later invocations using
-the original environment boundaries, pinned commit and contract, even if repository configuration changes
-or monitoring is disabled. After three unsuccessful cleanup attempts it needs operator intervention,
-as with existing resource cleanup. New deployments for that repository wait while teardown is unresolved.
-An unrecorded resource can only be recovered if it is discoverable by the run ID; resource labeling and
-complete inventory instructions are essential.
+Final stdout is `{"passed":["id"],"failed":[]}` with exit 0, or
+`{"passed":[],"failed":[{"id":"id","observation":"observed behavior"}]}` with exit 1.
+Every assertion appears once. Setup errors, crashes, missing dependencies, malformed
+results and timeouts are inconclusive. Deadline defects need a supported assertion in a
+healthy environment; timeout alone is never proof. Failed reset invalidates execution.
 
-As in source mode, `partial` runs advance the checkpoint; use `--force` to revisit gaps at an unchanged
-commit. Experiment artifacts follow normal run retention. A cross-run scenario library, automatic replay
-and test-only PRs are not part of this first version.
+Runner-owned receipts contain revision/hash, worker/profile/image, argv/cwd, timing,
+exit/signal/timeout, output, assertions, artifact hashes, setup/reset and cleanup. Issues
+require semantic confirmation and two fresh baseline failures. PRs also need the same
+bundle to pass on a fresh patch, independent patch review, comparable existing checks and
+clean teardown. New check failures block PRs; named pre-existing failures are disclosed.
+Missing proof stays local. Nonempty evidence files cannot authorize publication.
+Deduplication, attribution, independent branches and publication retries remain. No
+speculative issues, automatic merges or unsolicited passing-test-only PRs.
 
-**Models and effort.** Models are free-form provider identifiers; there is no list of model names to freeze. Use a Claude model or alias for `claude` (for example an Opus model) and a Codex catalog slug for `codex`. `reasoning_effort` maps to Codex `model_reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, as supported by the model in the installed catalog) or to Claude `--effort` (`low`, `medium`, `high`, `xhigh`, `max`). An unsupported combination is rejected with a clear message and never substituted. Agents run noninteractively with full shell and file access: Codex uses `--sandbox danger-full-access` with approvals disabled; Claude uses `bypassPermissions` without user settings or MCP servers.
+## Scheduling and retention
 
-## Test environments, credentials and trust
+Changed main triggers active replay before exploration, interleaving changed-path priority
+and old-scenario rotation. Due concrete tasks run on unchanged commits; idle repositories
+skip without models. Opt into weekly exploration with interval 7. Tasks deduplicate by
+workflow/invariant/trigger, retain higher priorities at the cap and keep attempts separate
+from checkpoints. Partial runs cannot erase them. Defaults: wait 24 hours, pause after
+three failed attempts; `--repo owner/project --force` resumes. Relevant contract/profile
+changes reset eligibility; unrelated commits do not reset repeated environment failures.
+Status/local reports show tasks, attempts, eligibility, scenario states and named execution.
+No routine backlog/no-findings GitHub posts.
 
-- **Running monitored project code on this host is a trust decision.** Agents can run anything the auto-test user can. The workspace is a separate checkout, not a security sandbox. Use a dedicated Linux account and dedicated, least-privilege GitHub and infrastructure credentials. The agents' home directory also holds the `gh` login; the prompts forbid GitHub writes, but prompts are not a security boundary.
-- Agents get a narrow environment: basic variables such as `HOME`, `PATH`, locale, proxies and CLI config directories, plus configured names and `AUTO_TEST_RUN_ID`, `AUTO_TEST_EVIDENCE_DIR` and `AUTO_TEST_RESOURCE_MANIFEST`. Anything else a project needs (for example `JAVA_HOME` or `DOCKER_CONFIG`) must be listed in `environment_variables` or `credential_environment_variables` and present in the cron environment.
-- Local setup (dependencies in the workspace or a virtualenv, disposable services with installed tools) is allowed. Host-wide installs, sudo and permission repair are not.
-- Live infrastructure is changed only in `allowed_targets`. Credentials being present does not designate a test environment; without a designated target, agents do only safe local work and report the gap. Production and production data are always excluded. Enforce the boundary with the supplied credentials. There is no Kubernetes/OpenStack policy language.
-- Agents put the run id in resource names or labels and record every resource in `resources.jsonl` (`created`/`removed` lines). After each run, unresolved resources trigger one cleanup session (the verification agent) that removes only the listed resources. Leftovers are retried by later invocations (at most 3 attempts) and reported as an `unresolved test resources` blocker. Cleanup after an abrupt host failure cannot be guaranteed. The persisted manifest and next-run reconciliation are the recovery path.
+Soft budget paces sessions rather than hard-killing them. Started valuable experiments,
+verification and cleanup may overrun; executable commands retain individual timeouts.
+Recovery precedes new work. Retention removes old run outputs while preserving bundles,
+compact receipt history and pending-report identities. State is private; publication
+redacts known secrets/token patterns. Inspect artifacts before sharing: patterns cannot
+catch every secret. Schedule only after validation, e.g. your own cron invoking
+`cd /path/to/auto-test && ./bin/run --once`. A lock skips overlaps; cron is not activated automatically.
 
-## Scheduling with cron
-
-Manual runs work without cron. To schedule:
-
-```sh
-EDITOR=vim crontab -e
-```
-
-```cron
-# AUTO-TEST
-CRON_TZ=Europe/Bratislava
-PATH=/home/kopi/.local/bin:/usr/local/bin:/usr/bin:/bin
-0 1 * * * /home/kopi/automations/auto-test/bin/run --once 2>&1 | /usr/bin/logger -t auto-test
-```
-
-- **Timezone.** `CRON_TZ` is honored by cronie (Fedora/RHEL/Arch). Debian/Ubuntu `cron` ignores it and uses the system timezone (`timedatectl`), so set the system timezone or convert the hour. The example runs at 01:00; change the first two fields to change the time.
-- **Environment.** cron provides a minimal environment: `bin/run` prepends `~/.local/bin` and `/usr/local/bin` to `PATH`. Add anything else in the crontab: custom `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`/`GH_TOKEN`, `KUBECONFIG`, `OS_CLOUD`, and so on. Credential variables must also be named in the configuration to reach agents.
-- One nonblocking lock (`var/auto-test.lock`) serializes invocations, including dry runs. An invocation that overlaps a long run logs and exits.
-- To stop scheduling, remove the `AUTO-TEST` block with `EDITOR=vim crontab -e`.
-
-## Operation
-
-```sh
-./bin/run --status
-```
-
-`--status` shows checkpoints, latest runs, pending publication, unresolved blockers and cleanup problems. `--dry-run --status` shows the same for dry-run state.
-
-```sh
-tail -f var/auto-test.log
-```
-
-The activity log records repository, commit, stages, providers/models/efforts, durations, coverage, overruns with the agent's reason, findings, publication links and cleanup. It is rotated at 1 MB with 3 backups. Per-run artifacts live in `var/runs/<run>/`:
-
-- `run.json`: the local record of what was tested.
-- `changes.txt`
-- `stages/*/`: `prompt.md`, `transcript.jsonl`, `result.json`.
-- `evidence/`
-- `project-contract.md`, `deployment.json`, `operational-report.md` (deployment mode)
-- `resources.jsonl`
-- `reports/*.md`
-
-Rerun after repairing tools, credentials or targets, even if `main` is unchanged:
-
-```sh
-./bin/run --repo owner/project --force
-```
-
-`--once` also retries pending work: publications, deferred fix revalidations, cleanup, and unfinished runs. Ctrl-C or `SIGTERM` terminates the agent's process group, marks the run `interrupted`, and leaves recorded resources for the next invocation to clean up.
-
-### Soft budget
-
-`soft_budget_minutes` covers setup, investigation, fixes, verification, reporting and cleanup of one repository. Every stage receives the start time, the target finish time (and a stage target: investigation aims to use about half the remaining time) and is asked to check the clock. It is **not** a kill timer. Near the target, auto-test starts no new investigation or fix. A confirmed finding still gets verified and reported, as an issue if no fix was verified. The nightly duration and subscription usage are therefore not strictly bounded. Short timeouts apply only to ordinary git/gh operations.
-
-### State, deduplication and retries
-
-- SQLite (`var/state.sqlite3`) holds checkpoints, runs and reports. Large artifacts stay in run directories.
-- Checkpoints include the testing mode independently of retained run artifacts. Databases created before
-  mode persistence are migrated automatically; checkpoints with an unknown mode are tested once again.
-- The checkpoint advances only for `completed` or `partial` runs, after results are saved. `blocked`, `incomplete` and `interrupted` runs retry on later invocations without a new commit. After 3 unsuccessful runs of one commit, auto-test pauses that commit and reports `repeated run failures` until `main` changes or you use `--force`.
-- Finding identity is the repository plus the agent-supplied component and root cause, never the SHA. The identity names the body marker; branches (`auto-test/fix-<id>-<run>`) also include the run ID so revalidation can publish a new branch without overwriting an earlier push. Open or pending reports are reused, and agents receive them to avoid rediscovery.
-- Before any create, auto-test looks up its own issues and PRs by marker (a consistent listing, not search) and PRs by branch. After an ambiguous create (a timeout or 5xx), it waits an hour and reconciles before creating again.
-- Reports closed by the owner are never reopened. If a finding recurs after its report was closed as completed or merged, it gets a new report that references the old one. If the report was closed as not planned or the PR was closed unmerged, the finding is suppressed. Blocker issues are keyed by capability; changed details and newly affected repositories update the issue.
-- Reworded or root-cause-ambiguous findings can still duplicate occasionally and may need owner review.
-- Publication failures keep the prepared bodies and retry with backoff, honoring GitHub rate limits, without repeating testing.
-- A PR whose patched files changed on `main` before publication, or whose tested baseline is no longer an ancestor of `main`, is fixed and verified again in the next run.
-- If GitHub is unavailable or unauthenticated, the invocation logs that and skips testing; queued publications wait.
-- A subscription limit defers the remaining repositories that use that provider. An expired login becomes a `<provider> agent setup` blocker.
-
-### Retention and privacy
-
-`var/` is mode 0700 and files are created with umask 077. After `retention_days`, run directories are deleted, except those with pending publication or unresolved cleanup. Checkpoints and report identities are kept. Oversized transcripts keep only their tail. Published bodies and the activity log contain sanitized excerpts: configured credential values, values of secret-looking environment variables and common token formats are redacted. Evidence and transcripts in `var/` can still contain sensitive output, so keep that directory private.
-
-## Development
+## Tests and evaluation
 
 ```sh
 python3 -m unittest discover -s tests -v
+python3 -m py_compile auto_test.py agents.py deployment.py github.py state.py util.py execution.py scenarios.py benchmarks/fixtures.py benchmarks/run.py
+python3 benchmarks/run.py --validate --output var/fixture-evaluation
 ```
+
+Normal tests use controlled fakes, never models/publication/live infrastructure. Process
+assertions require Linux `/proc`. Opt-in designated Linux boundary test:
+`AUTO_TEST_WORKER_CONFIG=/path/to/config.json python3 -m unittest discover -s tests -p test_execution.py -v`.
+Provision dedicated networks/canaries first.
+
+Five seeded defects cover retry duplication, restart durability, concurrency, byte
+boundaries and tenant permissions; two clean controls accompany them. Existing checks
+pass buggy snapshots; evaluator-only oracles fail initial/later defects and pass fixes.
+Neutral snapshots exclude oracles, labels, patches and fixed history. Fixture validation
+is not autonomous discovery.
 
 ```sh
-python3 -m py_compile auto_test.py agents.py deployment.py github.py state.py util.py
+python3 benchmarks/run.py --real-agents --config config.json --trials 3 --output var/trials-exploration
+python3 benchmarks/run.py --real-agents --review-only --config config.json --trials 3 --output var/trials-review
+python3 benchmarks/run.py --real-agents --config config.json --variant fixed --trials 3 --output var/trials-retention
 ```
 
-The tests use temporary repositories, a scripted fake `codex`/`claude` executable (`tests/fake_agent.py`) and a mocked GitHub. They spend no subscription usage, touch no live infrastructure and publish nothing.
+Campaigns use separate state and disable publication. Fixed campaigns replay passing
+bundles against later regressions without rediscovery. `--case case-01` selects a fixture;
+`--snapshot /path/to/snapshot --case case-01` accepts an explicit unscored snapshot without
+weakening main-only monitoring. Output directories must be new. All trials/setup failures
+are retained. Metrics include fixed-control replay, misses, duplicates, inconclusive
+candidates, passing scenarios, cleanup, duration and calls. Usage, root-cause agreement
+and owner triage time remain null when unmeasured; annotate from provider/evaluator
+records, never invented dollar costs. Review-only provider tools cannot be restricted,
+so that comparison is explicitly uncontrolled.
 
-Files:
-
-- `auto_test.py`: configuration, discovery, Git clones, run orchestration and the CLI.
-- `agents.py`: the CLI adapters, prompts and result schemas.
-- `deployment.py`: deployment evidence validation and operational reports.
-- `github.py`: `gh`, rendering, publication and reconciliation.
-- `state.py`: SQLite.
-- `util.py`: subprocesses and redaction.
-
-Before enabling scheduled publication on the Linux host, run `--check`, then a `--dry-run` per configured provider on a designated test repository with a seeded bug. Confirm that the evidence and prepared PR are reviewable and that any test resources were cleaned up.
+Engineering target: three seeded cases discovered/reproduced, zero confirmed false
+reports on controls, zero unresolved resources across three trials per case. Small
+trials are directional. No real-agent campaign or owner-designated pilot has run during
+implementation. Validate each configured provider with a complete real run, then pilot
+an owner-selected project across representative revisions or a week of dry runs, recording
+setup/triage effort and limitations before claiming effective autonomous discovery.

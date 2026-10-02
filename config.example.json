@@ -7,6 +7,31 @@
   "retention_days": 30,
   "environment_variables": [],
   "instructions": "",
+  "execution": {
+    "default": "local",
+    "profiles": {
+      "local": {
+        "backend": "docker",
+        "image": "owner/auto-test-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "network": "auto-test-internal",
+        "egress_policy": "provider-only-v1",
+        "cpus": 2,
+        "memory_mb": 2048,
+        "pids": 256,
+        "storage_mb": 512,
+        "uid": 1000,
+        "max_command_seconds": 300,
+        "artifact_bytes": 8000000,
+        "capabilities": ["local"],
+        "proxy_environment": {"HTTPS_PROXY": "http://egress-gateway:3128", "HTTP_PROXY": "http://egress-gateway:3128", "NO_PROXY": "localhost,127.0.0.1"},
+        "credentials": [
+          {"source": "worker-credentials/codex-auth.json", "target": ".codex/auth.json", "provider": "codex"},
+          {"source": "worker-credentials/claude-credentials.json", "target": ".claude/.credentials.json", "provider": "claude"}
+        ],
+        "canaries": []
+      }
+    }
+  },
   "agents": {
     "investigation": {
       "provider": "claude",
@@ -30,12 +55,18 @@
       "mode": "deployment",
       "enabled": true,
       "soft_budget_minutes": 30,
+      "execution_profile": "local",
+      "exploration_interval_days": 0,
+      "backlog_limit": 20,
+      "retry_delay_hours": 24,
+      "retry_cap": 3,
+      "replay_budget_fraction": 0.4,
       "instructions": "Use the documented development setup and synthetic test data.",
       "test_environment": {
-        "description": "Dedicated integration environment",
-        "allowed_targets": ["kubernetes context dev, namespace auto-test"],
-        "credential_environment_variables": ["KUBECONFIG"],
-        "instructions": "Create resources only in this namespace; remove resources created by this run."
+        "description": "Local application inside the disposable worker",
+        "allowed_targets": [],
+        "credential_environment_variables": [],
+        "instructions": "Use synthetic local data and runner-started foreground services."
       }
     }
   ]

@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import agents
 import deployment
 import github
+import execution
+import scenarios
 from agents import STAGES, AgentError
 from state import ACTIVE, DUE, State
 from util import Failure, Redactor, command, digest, slug
@@ -34,9 +36,10 @@ ORIGIN = re.compile(r'(?:git@github\.com:|ssh://git@github\.com/|https://(?:[^@/
 MAX_ATTEMPTS = 3  # Unsuccessful runs of one commit (and cleanup attempts) before pausing.
 SEVERITY = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
 GLOBAL_KEYS = {'auto_test_repository', 'monitored_directory', 'state_directory', 'timezone', 'soft_budget_minutes',
-               'retention_days', 'agents', 'repositories', 'instructions', 'environment_variables'}
+               'retention_days', 'agents', 'repositories', 'instructions', 'environment_variables', 'execution'}
 REPO_KEYS = {'name', 'enabled', 'soft_budget_minutes', 'instructions', 'agents', 'test_environment', 'clone_url',
-             'mode'}
+             'mode', 'execution_profile', 'exploration_interval_days', 'backlog_limit', 'retry_delay_hours',
+             'retry_cap', 'replay_budget_fraction'}
 ENV_KEYS = {'description', 'allowed_targets', 'credential_environment_variables', 'instructions'}
 
 
@@ -132,6 +135,8 @@ def load_config(path):
     if not isinstance(stages, dict) or set(stages) != set(STAGES):
         raise Failure('agents must configure exactly: ' + ', '.join(STAGES))
     cfg['agents'] = {s: _agent(stages[s], f'agents.{s}') for s in STAGES}
+    cfg['execution_profiles'] = execution.profiles(raw.get('execution'), base)
+    cfg['default_execution_profile'] = (raw.get('execution') or {}).get('default')
     entries = raw.get('repositories', [])
     if not isinstance(entries, list):
         raise Failure('repositories must be a list')
@@ -173,8 +178,21 @@ def load_config(path):
         mode = entry.get('mode', 'source')
         if mode not in ('source', 'deployment'):
             raise Failure(f'{name}: mode must be source or deployment')
+        profile = entry.get('execution_profile', cfg['default_execution_profile'])
+        if profile is not None and profile not in cfg['execution_profiles']:
+            raise Failure(f'{name}: unknown execution_profile')
+        scheduling = {}
+        for key, default, low, high in (('exploration_interval_days', 0, 0, 365), ('backlog_limit', 20, 1, 100),
+                                       ('retry_delay_hours', 24, 1, 720), ('retry_cap', 3, 1, 10),
+                                       ('replay_budget_fraction', .4, 0, .4)):
+            value = entry.get(key, default)
+            if type(value) not in (int, float) or not low <= value <= high \
+                    or (key in ('backlog_limit', 'retry_cap') and type(value) is not int):
+                raise Failure(f'{name}: {key} must be in {low}..{high}')
+            scheduling[key] = value
         cfg['repositories'].append({
             'name': name, 'checkout': str(checkout), 'test_environment': env, 'clone_url': clone_url, 'mode': mode,
+            'execution_profile': profile, **scheduling,
             'agents': {s: _agent({**cfg['agents'][s], **overrides.get(s, {})}, f'{name}: agents.{s}') for s in STAGES},
             'soft_budget_minutes': _positive(entry.get('soft_budget_minutes', cfg['soft_budget_minutes']),
                                              f'{name}: soft_budget_minutes'),
@@ -184,6 +202,10 @@ def load_config(path):
 
 
 # Runner-owned Git clones --------------------------------------------------------------------
+class WorkerSetupFailure(Failure):
+    """A worker or recipe could not start, rather than invalid agent output."""
+
+
 class MainMissing(Failure):
     pass
 
@@ -196,12 +218,14 @@ class Git:
         self.git = str(Path(git).absolute())
         self.root = root
         self.auth = list(auth)
-        self.env = {k: v for k, v in os.environ.items() if k not in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE')}
-        self.env.update(GIT_TERMINAL_PROMPT='0', GIT_LFS_SKIP_SMUDGE='1')
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        self.env.update(GIT_TERMINAL_PROMPT='0', GIT_LFS_SKIP_SMUDGE='1', GIT_CONFIG_NOSYSTEM='1',
+                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
 
-    def run(self, *args, cwd, timeout=300, network=False, check=True):
-        argv = [self.git, *(self.auth if network else []), *args]
-        return command(argv, cwd=cwd, env=self.env, timeout=timeout, check=check)
+    def run(self, *args, cwd, timeout=300, network=False, check=True, data=None, binary=False):
+        argv = [self.git, '-c', f'core.hooksPath={os.devnull}', '-c', 'core.fsmonitor=false',
+                *(self.auth if network else []), *args]
+        return command(argv, cwd=cwd, env=self.env, timeout=timeout, check=check, data=data, binary=binary)
 
     def out(self, *args, **kwargs):
         return self.run(*args, **kwargs).stdout
@@ -358,14 +382,37 @@ def unresolved(manifest):
 
 
 class Runner:
-    def __init__(self, cfg, state, gh, git, state_dir, dry_run=False):
+    def __init__(self, cfg, state, gh, git, state_dir, dry_run=False, direct_test_executor=False):
         self.cfg, self.state, self.gh, self.git = cfg, state, gh, git
         self.state_dir, self.dry_run = state_dir, dry_run
         names = set(cfg['environment_variables'])
         for repo in cfg['repositories']:
             names.update((repo['test_environment'] or {}).get('credential_environment_variables', []))
         self.redact = Redactor.from_environment(names)
+        # Explicit worker credential references are also redacted from model-authored reports.
+        secret_values = list(self.redact.values)
+        def credential_strings(value):
+            if isinstance(value, str):
+                if len(value) >= 16:
+                    secret_values.append(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    credential_strings(item)
+            elif isinstance(value, list):
+                for item in value:
+                    credential_strings(item)
+        for profile in cfg.get('execution_profiles', {}).values():
+            for reference in profile['credentials']:
+                path = Path(reference['source'])
+                if path.is_file() and not path.is_symlink() and path.stat().st_size <= 1_000_000:
+                    text = path.read_text(errors='replace')
+                    secret_values.append(text.strip())
+                    with contextlib.suppress(ValueError):
+                        credential_strings(json.loads(text))
+        self.redact = Redactor(secret_values)
         self.adapters, self.unusable, self.models = {}, {}, {}
+        # Dependency injection for the controlled scripted-agent unit tests only. No CLI/config switch.
+        self.direct_test_executor = direct_test_executor
 
     def iso(self, timestamp):
         return datetime.fromtimestamp(timestamp, self.cfg['tz']).isoformat(timespec='seconds')
@@ -379,6 +426,8 @@ class Runner:
 
     def adapter(self, cfg, env):
         """Locate and authenticate a provider once per invocation; no fallback to another provider."""
+        if not self.direct_test_executor:
+            raise Failure('Host provider execution is restricted to controlled unit-test executors')
         provider = cfg['provider']
         if provider in self.unusable:
             raise self.unusable[provider]
@@ -402,6 +451,13 @@ class Runner:
 
     # One repository -----------------------------------------------------------------------
     def process(self, repo, force=False):
+        if not self.direct_test_executor:
+            try:
+                return self.process_isolated(repo, force)
+            except Exception:
+                # Includes failures before run initialization or during finalization.
+                LOG.exception('Repository %s failed unexpectedly', repo['name'])
+                return 'incomplete'
         name = repo['name']
         if repo.get('mode') == 'deployment' and any(
                 row['repo'] == name and row['deployment'] is not None
@@ -476,6 +532,594 @@ class Runner:
             status, error = 'incomplete', repr(exc)
             LOG.exception('Run %s failed unexpectedly', run_id)
         return self.finish(run, status, error)
+
+    def recover_isolated(self):
+        self.state.mark_interrupted()
+        # Include runs already marked interrupted by an earlier migration/recovery.
+        for row in self.state.db.execute("SELECT * FROM runs WHERE status='interrupted' AND cleanup='none'").fetchall():
+            if row['deployment'] is not None or unresolved(Path(row['directory']) / 'resources.jsonl'):
+                self.state.set_cleanup(row['id'], 'pending')
+        for row in self.state.pending_workers():
+            record = json.loads(row['record'])
+            worker = execution.DockerWorker(record['profile'], row['run_id'], row['name'],
+                lambda r, run_id=row['run_id']: self.state.save_worker(run_id, r))
+            worker.record = record
+            try:
+                worker.stop()
+            except Exception as exc:
+                LOG.error('Worker recovery %s: %s', row['name'], exc)
+        for row in self.state.cleanup_problems():
+            if self.state.pending_workers(row['id']):
+                continue
+            workers = self.state.db.execute('SELECT 1 FROM workers WHERE run_id=?', (row['id'],)).fetchone()
+            if (workers or row['execution_mode'] == 'isolated') and row['deployment'] is None \
+                    and not unresolved(Path(row['directory']) / 'resources.jsonl'):
+                self.state.set_cleanup(row['id'], 'clean')
+            else:
+                LOG.error('Run %s needs operator cleanup at its original target; legacy scripts will not run '
+                          'on the host. Inspect %s', row['id'], row['directory'])
+
+    def process_isolated(self, repo, force=False):
+        name = repo['name']
+        if any(exc.kind == 'deferred' for exc in self.unusable.values()):
+            return 'deferred'
+        cleanup = [r for r in self.state.cleanup_problems() if r['repo'] == name]
+        if cleanup:
+            LOG.warning('%s: recover original cleanup obligations before starting new work', name)
+            self.blocker(name, '', '', 'resource cleanup', 'infrastructure',
+                'Pending cleanup for runs: ' + ', '.join(r['id'] for r in cleanup),
+                'Run --status and inspect the original resource manifests/deployment records. Restore the original '
+                'Docker daemon for worker cleanup. For legacy resources, clean them manually at the original target, '
+                'then use --acknowledge-cleanup RUN_ID --cleanup-note "what was verified and removed".')
+            return 'blocked'
+        profile = self.cfg['execution_profiles'].get(repo.get('execution_profile'))
+        if profile is None:
+            self.blocker(name, '', '', 'isolated worker setup', 'infrastructure',
+                         'An execution profile is required. Monitored code was not executed.',
+                         'Provision a Linux Docker worker image and internal egress network; see README migration.')
+            return 'blocked'
+        env = repo.get('test_environment') or {}
+        if env.get('allowed_targets') or env.get('credential_environment_variables') or self.cfg['environment_variables']:
+            self.blocker(name, '', '', 'worker credential migration', 'permissions',
+                         'Free-text remote targets and inherited environment credentials are unsupported.',
+                         'Use a local application and explicit worker credential file references in the trusted profile.')
+            return 'blocked'
+        try:
+            sha = self.git.fetch_main(name, repo['clone_url'] or self.gh.clone_url(name))
+        except Failure as exc:
+            self.blocker(name, '', '', 'repository access', 'permissions', str(exc), 'Restore access to main.')
+            return 'blocked'
+        try:
+            source = scenarios.snapshot(self.git, name, sha, profile['artifact_bytes'])
+        except (Failure, OSError, ValueError) as exc:
+            self.blocker(name, sha, '', 'source snapshot', 'infrastructure', str(exc),
+                         'Remove unsupported source links/submodules or adjust the worker transfer limit.')
+            return 'blocked'
+        contract = source.get('auto-test.md', (b'', False))[0]
+        policy_hash = digest(execution.fingerprint(profile) + scenarios.sha(contract), 64)
+        revalidate = self.state.reports(('revalidate',), repo=name)
+        for row in revalidate:
+            finding = json.loads(row['data'])['finding']
+            self.state.enqueue(name, 'revalidate-' + row['key'],
+                {'workflow': finding['component'], 'invariant': finding['expected_basis'],
+                 'trigger': finding['root_cause'], 'reason': 'Pending report requires fresh runner proof',
+                 'requires': [], 'priority': 80}, 80, sha, row['run_id'] or '', policy_hash, repo['backlog_limit'])
+        # Only contract/profile changes reset blocked work, never unrelated source commits.
+        for task in self.state.tasks(name):
+            if task['fingerprint'] != policy_hash:
+                self.state.enqueue(name, task['id'], json.loads(task['proposal']), task['priority'], sha,
+                                   task['origin_run'], policy_hash, repo['backlog_limit'])
+        tasks = self.state.due_tasks(name, repo['retry_cap'], force)
+        supported_tasks = []
+        for task in tasks:
+            missing = set(json.loads(task['proposal']).get('requires', [])) - set(profile['capabilities'])
+            if missing:
+                self.state.attempt_task(name, task['id'], False,
+                    'Missing local capabilities: ' + ', '.join(sorted(missing)), repo['retry_delay_hours'],
+                    force=force and task['attempts'] >= repo['retry_cap'])
+            else:
+                supported_tasks.append(task)
+        tasks = supported_tasks
+        last = self.state.checkpoint(name)
+        unchanged = bool(last and last['sha'] == sha and last['mode'] == repo.get('mode', 'source'))
+        periodic = bool(repo['exploration_interval_days'] and last and
+                        time.time() - last['completed'] >= repo['exploration_interval_days'] * 86400)
+        if unchanged and not (force or tasks or periodic):
+            LOG.info('Repository %s unchanged at %s: no work due; skipped', name, sha[:12])
+            return 'skipped'
+        if not force and any(t['attempts'] >= repo['retry_cap'] and
+                json.loads(t['proposal'])['workflow'] == 'local setup' for t in self.state.tasks(name)):
+            return 'paused'
+        # Failed setup on an uncheckpointed commit must also respect task backoff.
+        if not force and not tasks and self.state.tasks(name) and not periodic:
+            latest = next((r for r in self.state.latest_runs() if r['repo'] == name), None)
+            if latest and latest['sha'] == sha and latest['status'] in ('blocked', 'incomplete', 'interrupted'):
+                return 'paused'
+        run_id = f'{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{slug(name, 40)}-{sha[:8]}-{os.urandom(3).hex()}'
+        directory = self.state_dir / 'runs' / run_id
+        directory.mkdir(parents=True)
+        started = time.time()
+        run = Run(run_id, repo, sha, force, directory, started, started + repo['soft_budget_minutes'] * 60)
+        run.evidence.mkdir()
+        self.state.start_run(run_id, name, sha, force, repo['agents'], directory, execution_mode='isolated')
+        worker = None
+        receipts, discovered, replayed, deferred = [], [], [], []
+        completed_tasks = set()
+        status, error = 'incomplete', None
+        agent_error = False
+        recipe = None
+        replay = scenarios.Replay(self.state, directory / 'receipts', profile, run_id, name)
+
+        def queue(proposal, reason=None):
+            if not all(isinstance(proposal.get(k), str) and proposal[k].strip()
+                       for k in ('workflow', 'invariant', 'trigger', 'reason')):
+                return
+            ident = digest(':'.join(proposal[k] for k in ('workflow', 'invariant', 'trigger')), 32)
+            if not self.state.enqueue(name, ident, proposal, max(0, min(100, proposal.get('priority', 50))),
+                                      sha, run_id, policy_hash, repo['backlog_limit']):
+                deferred.append(proposal)
+            elif reason and ident not in {t['id'] for t in tasks}:
+                self.state.attempt_task(name, ident, False, reason, repo['retry_delay_hours'])
+            return ident
+
+        def stop_worker():
+            nonlocal worker
+            if worker is not None:
+                worker.stop()
+                worker = None
+
+        def session(stage, context, schema=None, instructions='', revision=sha, files=None):
+            nonlocal worker
+            if worker is None:
+                worker = execution.DockerWorker(profile, run_id, 'at-' + os.urandom(16).hex(),
+                                                lambda r: self.state.save_worker(run_id, r))
+                try:
+                    worker.start(providers={c['provider'] for c in repo['agents'].values()})
+                    worker.copy_in(files or source, '/work/workspace')
+                except (Failure, OSError, ValueError) as exc:
+                    raise WorkerSetupFailure(str(exc)) from exc
+                library, library_context, size = {}, [], 0
+                for row in self.state.catalog(name)[:20]:
+                    try:
+                        manifest, retained_files, retained_hash = scenarios.load(Path(row['bundle']))
+                    except (Failure, OSError, ValueError):
+                        continue  # Metadata still exposes this candidate for repair; never import broken files.
+                    if retained_hash != row['hash']:
+                        continue
+                    retained_files['manifest.json'] = (scenarios.canonical(manifest), False)
+                    bundle_size = sum(len(b) for b, _ in retained_files.values())
+                    if size + bundle_size > profile['artifact_bytes'] // 2:
+                        continue
+                    prefix = f'catalog/{row["id"]}/{row["version"]}/'
+                    library.update({prefix + k: v for k, v in retained_files.items()})
+                    library_context.append({'id': row['id'], 'version': row['version'],
+                                            'hash': retained_hash, 'path': '/work/run/' + prefix})
+                    size += bundle_size
+                if library:
+                    worker.copy_in(library, '/work/run')
+                worker.library_context = library_context
+            role = 'investigation' if stage == 'investigation' else stage
+            stage_name = f'{len(run.stages) + 1}-{stage}'
+            run.stages.append(stage_name)
+            ctx = {'repository': name, 'commit': revision, 'run_id': run_id, 'stage': stage,
+                   'testing_mode': repo['mode'],
+                   'budget': {'target_finish': self.iso(run.deadline), 'soft_budget_minutes': repo['soft_budget_minutes']},
+                   'instructions': repo['instructions'], 'changes': run.changes[:4000],
+                   'capabilities': profile['capabilities'], 'project_contract': contract.decode('utf8', 'replace'),
+                   'scenario_library': worker.library_context,
+                   **context}
+            return agents.run_worker_stage(worker, repo['agents'][role], stage, ctx,
+                directory / 'stages' / stage_name, schema, instructions)
+
+        def run_bundle(path, revision=sha, approved=True):
+            stop_worker()  # Provider credentials and all agent descendants absent during replay.
+            r = replay.execute(path, source if revision == sha else scenarios.snapshot(
+                self.git, name, revision, profile['artifact_bytes']), revision, recipe, approved)
+            receipts.append(r)
+            self.state.touch_scenario(r)
+            if r['cleanup'] != 'clean':
+                raise Failure('Replay cleanup failed; dependent work stopped')
+            if not scenarios.environment_failure(r):
+                completed_tasks.update(t['id'] for t in tasks
+                                       if json.loads(t['proposal'])['workflow'] == 'local setup')
+            return r
+
+        def require_environment(receipt, manifest):
+            if scenarios.environment_failure(receipt):
+                reason = receipt.get('error') or receipt.get('artifact_error') or 'Replay environment unavailable'
+                queue({'workflow': manifest['workflow'], 'invariant': manifest['expected_basis'],
+                       'trigger': manifest['hypothesis'], 'reason': reason, 'requires': manifest['requires'],
+                       'priority': 70, 'scenario_id': manifest['id'], 'version': manifest['version']}, reason)
+                raise WorkerSetupFailure(reason)
+
+        def accept_recipe(result, exported):
+            nonlocal recipe, workflow_passed
+            try:
+                if not result['recipe_path']:
+                    if recipe is None:
+                        raise Failure('No setup/readiness/identity/existing-check recipe was supplied')
+                    replacement = recipe
+                else:
+                    relative = execution.relative(result['recipe_path'])
+                    if relative not in exported:
+                        raise Failure('Recipe export missing')
+                    replacement = scenarios.recipe(json.loads(exported[relative][0]))
+                if repo['mode'] == 'deployment' and not replacement['services']:
+                    raise Failure('Local deployment mode requires a foreground service and deployed revision probe')
+                if self.redact.found(json.dumps(replacement)):
+                    raise Failure('Recipe contains secret-like content')
+            except (Failure, ValueError, TypeError) as exc:
+                raise AgentError(f'Invalid recipe: {exc}', 'invalid') from exc
+            setup_due = any(t['id'] not in completed_tasks and
+                            json.loads(t['proposal'])['workflow'] == 'local setup' for t in tasks)
+            if replacement != recipe or setup_due:
+                if replacement != recipe:
+                    workflow_passed = repo['mode'] != 'deployment'
+                recipe = replacement
+                r = run_bundle(None, approved=False)
+                if not r.get('setup_ok') or r['outcome'] != 'passed':
+                    raise WorkerSetupFailure(r.get('error', 'Recipe setup validation failed'))
+                self.state.save_recipe(name, recipe, sha, policy_hash, validated=True)
+            completed_tasks.update(t['id'] for t in tasks
+                                   if json.loads(t['proposal'])['workflow'] == 'local setup')
+
+        def prior_files(ident):
+            result = []
+            for row in [r for r in catalog if r['id'] == ident][-5:]:
+                try:
+                    files = scenarios.load(Path(row['bundle']))[1]
+                    result.append({'version': row['version'], 'files': {
+                        k: b.decode('utf8', 'replace') for k, (b, _) in files.items()}})
+                except (Failure, OSError) as exc:
+                    result.append({'version': row['version'], 'error': str(exc)})
+            return result
+
+        def replay_retained():
+            nonlocal workflow_passed
+            for row in sorted(ordered, key=lambda r: json.loads(r['metadata'])['kind'] != 'workflow'):
+                if time.time() >= replay_deadline:
+                    break
+                m = json.loads(row['metadata'])
+                if m['kind'] != 'workflow' and not workflow_passed:
+                    continue
+                r = run_bundle(Path(row['bundle']))
+                replayed.append({'id': row['id'], 'version': row['version'], 'outcome': r['outcome']})
+                require_environment(r, m)
+                workflow_passed |= m['kind'] == 'workflow' and r['outcome'] == 'passed'
+                if r['outcome'] == 'passed':
+                    for task in tasks:
+                        p = json.loads(task['proposal'])
+                        if p.get('scenario_id') == row['id'] and p.get('version', row['version']) == row['version']:
+                            completed_tasks.add(task['id'])
+                if r['outcome'] != 'passed':
+                    second = run_bundle(Path(row['bundle']))
+                    require_environment(second, m)
+                    self.state.scenario_result(name, row['id'], row['version'], [r, second])
+                    failures.append({'scenario': {k: row[k] for k in ('id', 'version', 'metadata', 'reason')},
+                                     'receipts': [r, second]})
+                    queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
+                           'reason': 'Investigate replay failure or repair quarantined scenario',
+                           'requires': m['requires'], 'priority': 80,
+                           'scenario_id': row['id'], 'version': row['version']})
+
+        try:
+            self.state.arm_deployment_cleanup(run_id)
+            run.changes_mode, run.changes = self.git.changes(name, last['sha'] if last else None, sha)
+            recipe_record = self.state.recipe(name, policy_hash)
+            if recipe_record:
+                candidate = json.loads(recipe_record['recipe'])
+                # Recipe validity follows its declared paths and pinned contract/profile.
+                paths = list(dict.fromkeys(candidate['relevance_paths'] + ['auto-test.md']))
+                if recipe_record['revision'] == sha or (paths and self.git.ancestor(name, recipe_record['revision'], sha)
+                        and not self.git.changed(name, recipe_record['revision'], sha, paths)):
+                    recipe = candidate
+            status = 'completed'
+            catalog = self.state.catalog(name)
+            seen_scenario_hashes = {r['hash'] for r in catalog}
+            changed = self.git.changed(name, last['sha'], sha, []) if last and last['sha'] != sha \
+                and self.git.ancestor(name, last['sha'], sha) else []
+            active = [r for r in catalog if r['state'] == 'active']
+            # Alternate relevant and oldest scenarios so diff priority never starves rotation.
+            relevant = [r for r in active if any(p == c or c.startswith(p + '/') for p in
+                json.loads(r['metadata'])['relevance_paths'] for c in changed)]
+            ordered = []
+            while active or relevant:
+                for group in (relevant, active):
+                    if group:
+                        item = group.pop(0)
+                        if (item['id'], item['version']) not in {(r['id'], r['version']) for r in ordered}:
+                            ordered.append(item)
+            replay_deadline = started + repo['soft_budget_minutes'] * 60 * repo['replay_budget_fraction']
+            workflow_passed = repo['mode'] != 'deployment'
+            failures = []
+            if recipe is None and ordered:
+                setup, exported = session('investigation', {'mode': 'setup', 'catalog': [],
+                    'due_tasks': [], 'replay_failures': []}, agents.DISCOVERY_SCHEMA,
+                    agents.EXPLORATORY_RULES + '\nOnly discover the setup recipe. Return no scenarios or findings. '
+                    'Retained scenarios must replay before new exploration.')
+                run.blockers.extend(setup['blockers'])
+                accept_recipe(setup, exported)
+                # Setup rediscovery must not consume the retained replay allocation.
+                replay_deadline = time.time() + repo['soft_budget_minutes'] * 60 * repo['replay_budget_fraction']
+            if recipe:
+                replay_retained()
+            # An unchanged run with replay-only tasks can complete without a model call.
+            def task_replayed(task):
+                p = json.loads(task['proposal'])
+                def matches(row):
+                    return row['id'] == p.get('scenario_id') and (
+                        not p.get('version') or row['version'] == p['version'])
+                return any(matches(r) and r['outcome'] == 'passed' for r in replayed) and not any(
+                    matches(r) and r['state'] == 'candidate' for r in catalog)
+            replay_only = tasks and all(task_replayed(t) for t in tasks)
+            if time.time() >= run.deadline and not failures:
+                status = 'partial'
+            elif unchanged and replay_only and not failures and recipe and replayed and not (force or periodic):
+                for task in tasks:
+                    if json.loads(task['proposal'])['scenario_id'] in {r['id'] for r in replayed}:
+                        completed_tasks.add(task['id'])
+            else:
+                context = {'catalog': [{k: row[k] for k in ('id', 'version', 'state', 'metadata', 'reason',
+                                                          'last_pass_commit', 'last_fail_commit')} for row in catalog[:20]],
+                           'due_tasks': [json.loads(t['proposal']) for t in tasks],
+                           'replay_failures': failures, 'known_findings': [r['title'] for r in
+                               self.state.reports(ACTIVE, repo=name) if r['kind'] != 'blocker'][-30:],
+                           'pending_revalidation': [json.loads(r['data'])['finding'] for r in revalidate]}
+                result, exported = session('investigation', context, agents.DISCOVERY_SCHEMA,
+                                           agents.EXPLORATORY_RULES)
+                run.summaries.append(result['summary'])
+                run.blockers.extend(result['blockers'])
+                if result['outcome'] != 'completed':
+                    status = result['outcome']
+                for proposal in result['unfinished']:
+                    queue(proposal)
+                previous_recipe = recipe
+                accept_recipe(result, exported)
+                if ordered and previous_recipe != recipe:
+                    replay_deadline = time.time() + repo['soft_budget_minutes'] * 60 * repo['replay_budget_fraction']
+                    replay_retained()
+                proposed = []
+                for item in result['scenarios']:
+                    try:
+                        prefix = execution.relative(item['path']) + '/'
+                        files = {k[len(prefix):]: v for k, v in exported.items() if k.startswith(prefix)}
+                        manifest = json.loads(files.pop('manifest.json')[0])
+                        index = item['finding_index']
+                        if index < -1 or index >= len(result['findings']):
+                            raise Failure('Scenario finding_index is invalid')
+                        scenarios.validate(manifest, files, profile['artifact_bytes'], self.redact)
+                        path, content_hash = scenarios.freeze(self.state_dir / 'scenarios', name, manifest, files, self.redact)
+                        self.state.add_scenario(name, manifest, content_hash, path, run_id, sha)
+                    except (Failure, KeyError, ValueError) as exc:
+                        run.unpublished.append(f'Scenario {item["path"]}: {exc}')
+                        status = 'partial'
+                        continue
+                    proposed.append((manifest, path, content_hash,
+                                     result['findings'][index] if index >= 0 else None))
+                # Budget-deferred candidates already have immutable bundles. Resume them
+                # even if discovery does not export a second copy of the same proposal.
+                for task in tasks:
+                    p = json.loads(task['proposal'])
+                    for row in catalog:
+                        if row['state'] != 'candidate' or row['id'] != p.get('scenario_id') \
+                                or (p.get('version') and row['version'] != p['version']) \
+                                or row['hash'] in {v[2] for v in proposed}:
+                            continue
+                        try:
+                            m, _, content_hash = scenarios.load(Path(row['bundle']))
+                            if content_hash != row['hash']:
+                                raise Failure('Retained candidate differs from its catalog hash')
+                        except (Failure, OSError, ValueError) as exc:
+                            self.state._write("UPDATE scenarios SET state='quarantined',reason=? "
+                                'WHERE repo=? AND id=? AND version=?', (str(exc), name, row['id'], row['version']))
+                            run.unpublished.append(f'{row["id"]}/{row["version"]}: {exc}')
+                            status = 'partial'
+                            continue
+                        proposed.append((m, Path(row['bundle']), content_hash, p.get('finding')))
+                proposed.sort(key=lambda p: p[0]['kind'] != 'workflow')
+                for manifest, path, content_hash, finding in proposed:
+                    m = manifest
+                    if time.time() >= run.deadline:
+                        queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
+                               'reason': 'Budget exhausted before runner replay', 'requires': m['requires'],
+                               'priority': 60, 'scenario_id': m['id'], 'version': m['version'], 'finding': finding})
+                        self.state.add_scenario(name, m, content_hash, path, run_id, sha)
+                        continue
+                    # Independent semantic session gets the frozen proposal and recipe, never model-written proof.
+                    stop_worker()
+                    review, _ = session('verification', {'manifest': m, 'recipe': recipe, 'finding': finding,
+                        'frozen_files': {k: b.decode('utf8', 'replace') for k, (b, _) in scenarios.load(path)[1].items()},
+                        'prior_versions': [{k: r[k] for k in ('id', 'version', 'metadata', 'hash', 'reason')}
+                                           for r in catalog if r['id'] == m['id']][-5:],
+                        'prior_files': prior_files(m['id'])}, agents.REVIEW_SCHEMA,
+                        'Review expected behavior against pinned docs/source. Check assertions observe application '
+                        'interfaces or independent state; reject echoed claims and unsupported assumptions. Check '
+                        'setup/identity/reset and existing checks. This is semantic review, not execution proof. '
+                        'In deployment mode identity must query the service; unit-test reruns are not user workflows. '
+                        'Identify duplicate workflow/invariant/trigger; replacing expectations needs documented '
+                        'intentional_change_basis. Set expectations_changed only for a changed behavioral '
+                        'expectation, not import/reset/execution repairs. Compare prior scripts as well as metadata. '
+                        'Return only the requested review schema.')
+                    approved = review['supported'] and review['observes_application'] and \
+                        review['existing_checks_adequate'] and bool(review['expected_basis'].strip())
+                    if review['expectations_changed'] \
+                            and not review['intentional_change_basis']:
+                        approved = False
+                    self.state.add_scenario(name, m, content_hash, path, run_id, sha, review)
+                    if not approved or review['duplicate_of']:
+                        run.unpublished.append(m['id'] + ': ' + review['reason'])
+                        continue
+                    if m['kind'] != 'workflow' and not workflow_passed:
+                        queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
+                               'reason': 'Baseline workflow has not passed; fault injection blocked',
+                               'requires': m['requires'], 'priority': 60})
+                        continue
+                    before = []
+                    for _ in range(2):
+                        receipt = run_bundle(path)
+                        before.append(receipt)
+                        require_environment(receipt, m)
+                    consistent = self.state.scenario_result(name, m['id'], m['version'], before)
+                    discovered.append({'id': m['id'], 'version': m['version'], 'kind': m['kind'],
+                                       'origin': m['origin'], 'outcome': before[-1]['outcome'],
+                                       'new': content_hash not in seen_scenario_hashes})
+                    seen_scenario_hashes.add(content_hash)
+                    if consistent:
+                        self.state.save_recipe(name, recipe, sha, policy_hash, validated=True)
+                        workflow_passed |= m['kind'] == 'workflow' and before[-1]['outcome'] == 'passed'
+                        for task in tasks:
+                            p = json.loads(task['proposal'])
+                            if (p['workflow'] == m['workflow'] and
+                                    p['invariant'] == m['expected_basis'] and p['trigger'] == m['hypothesis']):
+                                completed_tasks.add(task['id'])
+                    else:
+                        queue({'workflow': m['workflow'], 'invariant': m['expected_basis'], 'trigger': m['hypothesis'],
+                               'reason': 'Inconclusive reproduction; repair frozen scenario in a new version',
+                               'requires': m['requires'], 'priority': 70}, 'Inconclusive or inconsistent replay')
+                    if not finding or not scenarios.proof_ok(before, name, sha, content_hash):
+                        continue
+                    key_base = 'f-' + digest(f'{name}:{slug(finding["component"])}:{slug(finding["root_cause"])}')
+                    known = self.state.latest_report(key_base)
+                    if known and (known['status'] in ACTIVE and known['status'] != 'revalidate'
+                                  or known['status'] == 'closed-rejected'):
+                        self.state.touch_report(known['key'])
+                        run.known.append(known['key'])
+                        continue
+                    generation = known['generation'] + 1 if known and known['status'] != 'revalidate' else \
+                        known['generation'] if known else 1
+                    key = f'{key_base}-{generation}'
+                    kind, fix, commit, branch = 'issue', None, None, None
+                    fix_notes = []
+                    if finding['disposition'] == 'fix' and time.time() < run.deadline:
+                        try:
+                            fix, _ = session('fixing', {'finding': finding, 'baseline_commit': sha,
+                                                      'frozen_scenario': m}, instructions=
+                                'Fix the source and add a native regression test. Do not modify the frozen scenario. '
+                                'List exact changed files; the runner imports and commits them. Do not publish.')
+                            if fix['outcome'] == 'completed' and fix['fixed']:
+                                changes = worker.copy_out('/work/workspace', fix['files'])
+                                stop_worker()
+                                try:
+                                    self.git.worktree(name, run.workspace, sha)
+                                    branch = f'auto-test/fix-{key}-{run.id}'
+                                    self.git.prepare(run.workspace, sha, branch)
+                                    for filename in fix['files']:
+                                        execution.relative(filename)
+                                        if filename in changes:
+                                            scenarios.write_files(run.workspace, {filename: changes[filename]})
+                                        elif (run.workspace / filename).is_file():
+                                            (run.workspace / filename).unlink()
+                                    commit = self.git.commit_fix(run.workspace, sha, fix['files'],
+                                        'Fix: ' + finding['title'][:72], self.redact)
+                                finally:
+                                    self.git.remove_worktree(name, run.workspace)
+                                after = run_bundle(path, commit)
+                                patch_review, _ = session('verification', {'mode': 'fix', 'finding': finding,
+                                    'fix': fix, 'fix_commit': commit, 'baseline_commit': sha,
+                                    'runner_receipts': [*before, after]}, instructions=
+                                    'Independently review the patch, documented expectation, and frozen runner receipts. '
+                                    'Report confirmed/effective only if the remedy fixes the cause without weakening '
+                                    'assertions or introducing regressions.', revision=commit,
+                                    files=scenarios.snapshot(self.git, name, commit, profile['artifact_bytes']))
+                                stop_worker()
+                                if scenarios.proof_ok([*before, after], name, sha, content_hash, commit) and \
+                                        patch_review['verdict'] == 'confirmed' and patch_review['fix_verdict'] == 'effective':
+                                    kind = 'pr'
+                                    self.state.link_scenario(name, m['id'], m['version'], key,
+                                        json.dumps(fix['regression_tests']) if fix['regression_tests'] else None)
+                                else:
+                                    fix_notes.append('Optional patch was not verified effective: ' + patch_review['reason'])
+                                    kind, fix, commit, branch = 'issue', None, None, None
+                        except (Failure, AgentError, OSError, ValueError) as exc:
+                            fix_notes.append('Optional fix failed: ' + str(exc))
+                            run.unpublished.append(m['id'] + ': ' + fix_notes[-1])
+                            kind, fix, commit, branch = 'issue', None, None, None
+                            if isinstance(exc, AgentError) and exc.kind == 'deferred':
+                                self.unusable['subscription'] = exc
+                        finally:
+                            stop_worker()
+                        if self.state.pending_workers(run_id):
+                            raise Failure('Fix worker cleanup failed; dependent work stopped')
+                    verification = {'outcome': 'completed', 'verdict': 'confirmed',
+                        'fix_verdict': 'effective' if kind == 'pr' else 'not_applicable', 'checks': [],
+                        'summary': review['reason'], 'reason': review['expected_basis'],
+                        'preexisting_failures': [c['stdout'][-2000:] + c['stderr'][-2000:]
+                            for c in [before[0].get('existing_checks', {})] if c.get('exit_code')],
+                        'limitations': fix_notes}
+                    proof = [r for r in receipts if r['bundle_hash'] == content_hash and r['revision'] in
+                             (sha, commit if kind == 'pr' else sha)]
+                    for r in proof:
+                        verification['checks'].append({'target': 'baseline' if r['revision'] == sha else 'patched',
+                            'bug_observed': r['outcome'] == 'failed', 'exit_code': 1 if r['outcome'] == 'failed' else 0,
+                            'command': json.dumps(m['run_argv']), 'notes': 'Runner receipt ' + r['id'],
+                            'evidence': str(directory / 'receipts' / f'{r["id"]}.json')})
+                    self.report(run, kind, key, key_base, generation, finding, verification, [], [],
+                                known['url'] if known and known['status'] == 'closed-fixed' else None,
+                                fix, commit if kind == 'pr' else None, branch if kind == 'pr' else None)
+                    row = self.state.report(key)
+                    data = json.loads(row['data'])
+                    data.update(receipt_ids=[r['id'] for r in proof], bundle_hash=content_hash)
+                    self.state.update_report(key, data=json.dumps(data))
+                    self.state.link_scenario(name, m['id'], m['version'], key)
+                    completed_tasks.update(t['id'] for t in tasks if t['id'] == 'revalidate-' + key)
+        except KeyboardInterrupt:
+            status, error = 'interrupted', 'interrupted'
+            raise
+        except (Failure, AgentError, OSError, ValueError) as exc:
+            agent_error = isinstance(exc, AgentError) and exc.kind != 'setup'
+            if isinstance(exc, AgentError) and exc.kind == 'deferred':
+                self.unusable['subscription'] = exc
+            status = 'blocked' if isinstance(exc, WorkerSetupFailure) or \
+                isinstance(exc, AgentError) and exc.kind == 'setup' else 'incomplete'
+            error = str(exc)
+            LOG.error('Run %s: %s', run_id, exc)
+            if isinstance(exc, AgentError) and exc.kind == 'setup':
+                self.blocker(name, sha, run_id, 'worker provider setup', 'credentials', error,
+                             'Restore the dedicated worker subscription login/model and run --check-worker.')
+            if isinstance(exc, WorkerSetupFailure):
+                self.blocker(name, sha, run_id, 'isolated worker setup', 'infrastructure', error,
+                    'Check the Docker daemon, worker image/network policy, quotas and recipe setup logs. '
+                    'Repair the cause, run --check-worker, then retry this repository with --force.')
+            if isinstance(exc, WorkerSetupFailure) or isinstance(exc, AgentError) and exc.kind == 'setup':
+                queue({'workflow': 'local setup', 'invariant': 'worker and recipe usable', 'trigger': 'resume setup',
+                       'reason': error, 'requires': [], 'priority': 100}, error)
+        except Exception as exc:
+            status, error = 'incomplete', repr(exc)
+            LOG.exception('Run %s failed unexpectedly', run_id)
+        finally:
+            try:
+                stop_worker()
+            except Exception as exc:
+                error = f'{error or ""}; worker cleanup: {exc}'
+            clean = not self.state.pending_workers(run_id)
+            self.state.set_cleanup(run_id, 'clean' if clean else 'pending')
+            for task in tasks:
+                if agent_error and task['id'] not in completed_tasks:
+                    continue
+                self.state.attempt_task(name, task['id'], task['id'] in completed_tasks,
+                    None if task['id'] in completed_tasks else error or 'Concrete proposal remains unfinished',
+                    repo['retry_delay_hours'], force=force and task['attempts'] >= repo['retry_cap'])
+            if status == 'completed' and (run.blockers or self.state.tasks(name) or not clean):
+                status = 'partial'
+            for b in run.blockers:
+                self.blocker(name, sha, run_id, b['capability'], b['category'], b['details'], b['owner_action'])
+            new_count = sum(r['new'] and r['origin'] != 'existing_test' for r in discovered)
+            summary = f'replay={len(replayed)} new_exploration={new_count} '
+            summary += f'agent_calls={len(run.stages)} reports={len(run.reports)} tasks={len(self.state.tasks(name))}'
+            output = dict(id=run_id, repository=name, commit=sha, status=status, error=error, cleanup='clean' if clean else 'pending',
+                replay=replayed, exploration=discovered, deferred=deferred, tasks=[dict(t) for t in self.state.tasks(name)],
+                agent_calls=len(run.stages), new_exploration=new_count, seconds=time.time() - started,
+                stages=run.stages, receipts=[r['id'] for r in receipts], notes=run.unpublished)
+            output['coverage_gaps'] = [] if receipts else ['No runner-executed scenarios in this run']
+            (directory / 'run.json').write_text(self.redact(json.dumps(output, indent=2)))
+            (directory / 'operational-report.md').write_text(self.redact(
+                f'# {name} at {sha}\n\n{summary}\n\n' + '\n'.join(
+                    f'- {r["id"]}: {r["outcome"]}' for r in [*replayed, *discovered]) +
+                f'\n\nCleanup: {output["cleanup"]}. Error: {error or "none"}.\n'))
+            self.state.finish_run(run_id, status, summary, error)
+            if status in ('completed', 'partial'):
+                self.state.set_checkpoint(name, sha, run_id, repo['mode'])
+        return status
 
     def operational_stage(self, run, stage, name, **extra):
         started = time.time()
@@ -798,6 +1442,8 @@ class Runner:
                      f'(see README: provider authentication), then rerun.', provider)
 
     def stage(self, run, stage, name, context, workdir=None):
+        if not self.direct_test_executor:
+            raise Failure('Host agent execution is restricted to controlled unit-test executors')
         role = {'cleanup': 'verification', 'teardown': 'verification', 'deployment': 'investigation',
                 'baseline': 'investigation', 'exploration': 'investigation'}.get(stage, stage)
         cfg = run.repo['agents'][role]
@@ -934,6 +1580,8 @@ class Runner:
 
     def recover(self):
         """Handle runs cut off by a crash or kill, and retry pending cleanup of recorded resources."""
+        if not self.direct_test_executor:
+            return self.recover_isolated()
         repos = {r['name']: r for r in self.cfg['repositories']}
         for row in self.state.mark_interrupted():
             LOG.warning('Run %s was interrupted; recovering its records', row['id'])
@@ -977,15 +1625,101 @@ class Runner:
 
     def retention(self):
         cutoff = time.time() - self.cfg['retention_days'] * 86400
-        keep = {r['run_id'] for r in self.state.reports(DUE)}
+        keep = {r['run_id'] for r in self.state.reports((*DUE, 'revalidate', 'prepared'))}
         for row in self.state.prunable(cutoff):
             if row['id'] not in keep:
                 shutil.rmtree(row['directory'], ignore_errors=True)
+                self.state.prune_execution_outputs(row['id'])
                 self.state.mark_pruned(row['id'])
                 LOG.info('Retention: removed artifacts of run %s', row['id'])
 
 
 # Commands -----------------------------------------------------------------------------------
+def check_workers(cfg, state, state_dir):
+    """Explicit diagnostics use only owner-designated canaries, never production probes."""
+    if not cfg['execution_profiles']:
+        raise Failure('Configure execution.profiles before --check-worker')
+    failed = False
+    for name, profile in cfg['execution_profiles'].items():
+        run_id = 'diagnostic-' + os.urandom(12).hex()
+        directory = state_dir / 'diagnostics' / run_id
+        directory.mkdir(parents=True)
+        worker = execution.DockerWorker(profile, run_id, 'at-' + os.urandom(16).hex(),
+                                        lambda r: state.save_worker(run_id, r))
+        output = {'profile': name, 'checks': [], 'limitations': [
+            'Gateway destination enforcement and scoped credential provisioning remain owner responsibilities.',
+            'A container shares the Docker host kernel; use a dedicated Linux test VM.']}
+        sentinel = directory / 'host-sentinel'
+        sentinel.write_text('runner filesystem sentinel')
+        try:
+            configs = [a for r in cfg['repositories'] if r['execution_profile'] == name
+                       for a in r['agents'].values()] or list(cfg['agents'].values())
+            worker.start({a['provider'] for a in configs})
+            test = worker.exec(['python3', '-c',
+                'import os,pathlib; assert not pathlib.Path(' + repr(str(sentinel)) + ').exists(); '
+                'assert not any(k in os.environ for k in ("GH_TOKEN","GITHUB_TOKEN","SSH_AUTH_SOCK",'
+                '"DOCKER_HOST","OPENAI_API_KEY","ANTHROPIC_API_KEY")); '
+                'assert not pathlib.Path("/var/run/docker.sock").exists(); print("boundary canaries passed")'])
+            if test['exit_code']:
+                raise Failure('Filesystem/environment boundary canary failed')
+            output['checks'].append(test)
+            for config in {json.dumps(c, sort_keys=True): c for c in configs}.values():
+                agents.worker_adapter(worker, config)
+                output['checks'].append({'provider': config['provider'], 'subscription_login': True})
+            if not profile['canaries'] or {c['allowed'] for c in profile['canaries']} != {True, False}:
+                raise Failure('Configure both authorized and unauthorized disposable canaries for --check-worker')
+            for canary in profile['canaries']:
+                for direct in (False, True):
+                    code = ('import urllib.request,urllib.error; '
+                            'opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))' if direct else
+                            'import urllib.request,urllib.error; opener=urllib.request.build_opener()')
+                    code += '\ntry:\n r=opener.open(' + repr(canary['url']) + ',timeout=5); print("reachable"); exit(0)'
+                    code += '\nexcept urllib.error.HTTPError: print("http-response"); exit(0)'
+                    code += '\nexcept (OSError,urllib.error.URLError): print("unreachable"); exit(1)'
+                    result = worker.exec(['python3', '-c', code], timeout=10)
+                    reachable = result['exit_code'] == 0
+                    # Allowed destinations may require the gateway. Unauthorized ones must fail both routes.
+                    if (not canary['allowed'] and reachable) or (canary['allowed'] and not direct and not reachable):
+                        raise Failure('Network canary violated expected access policy')
+                    output['checks'].append({'url': canary['url'], 'direct': direct, 'reachable': reachable})
+            quota = worker.exec(['python3', '-c',
+                'import errno\ntry:\n f=open("/work/quota-canary","wb",buffering=0)\n'
+                ' while True: f.write(b"x"*1048576)\n'
+                'except OSError as e:\n assert e.errno == errno.ENOSPC; print("storage_limit")\n'
+                'finally:\n import os; os.unlink("/work/quota-canary")'], timeout=60)
+            if quota['exit_code'] or 'storage_limit' not in quota['stdout']:
+                raise Failure('Writable-storage quota was not demonstrated')
+            output['checks'].append(quota)
+            pid_probe = ('import os,time,errno,signal\nchildren=[]\ntry:\n'
+                f' for _ in range({profile["pids"] + 1}):\n'
+                '  pid=os.fork()\n  if pid==0: time.sleep(30); os._exit(0)\n  children.append(pid)\n'
+                ' raise AssertionError("process quota not enforced")\n'
+                'except OSError as e:\n assert e.errno==errno.EAGAIN; print("process_limit")\n'
+                'finally:\n for pid in children:\n  os.kill(pid,signal.SIGKILL); os.waitpid(pid,0)')
+            quota = worker.exec(['python3', '-c', pid_probe], timeout=30)
+            if quota['exit_code'] or quota.get('limit') != 'process_limit':
+                raise Failure('Process quota was not demonstrated/classified')
+            output['checks'].append(quota)
+            quota = worker.exec(['python3', '-c', 'items=[]\nwhile True: items.append(bytearray(8*1024*1024))'], timeout=30)
+            if quota.get('limit') != 'memory_limit':
+                raise Failure('Memory quota was not demonstrated/classified')
+            output['checks'].append(quota)
+            worker.service(['python3', '-c', 'import time; time.sleep(3600)'])
+        except (Failure, AgentError, OSError, ValueError) as exc:
+            failed = True
+            output['error'] = str(exc)
+        finally:
+            try:
+                worker.stop()
+                output['cleanup'] = 'clean'
+            except Exception as exc:
+                failed = True
+                output['cleanup'] = str(exc)
+            (directory / 'result.json').write_text(Redactor.from_environment()(json.dumps(output, indent=2)))
+        print(f'{name}: {output.get("error", "passed")} cleanup={output["cleanup"]}; {directory / "result.json"}')
+    return int(failed)
+
+
 @contextlib.contextmanager
 def lock(path):
     with open(path, 'a') as handle:
@@ -1000,9 +1734,9 @@ def lock(path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def cycle(cfg, state, gh, state_dir, only=None, force=False, dry_run=False):
+def cycle(cfg, state, gh, state_dir, only=None, force=False, dry_run=False, direct_test_executor=False):
     git = Git(state_dir / 'repos', gh.git_config())
-    runner = Runner(cfg, state, gh, git, state_dir, dry_run)
+    runner = Runner(cfg, state, gh, git, state_dir, dry_run, direct_test_executor)
     repos = [r for r in cfg['repositories'] if only is None or r['name'] == only]
     if only is not None and not repos:
         raise Failure(f'{only} is not a discovered, enabled repository')
@@ -1019,12 +1753,12 @@ def cycle(cfg, state, gh, state_dir, only=None, force=False, dry_run=False):
     counts = {}
     if not dry_run:
         github.sync(state, gh)
-        counts = github.publish(state, gh, git)  # Earlier results first; may queue fix revalidation.
+        counts = github.publish(state, gh, git, require_receipts=not direct_test_executor)
     outcomes = {}
     for repo in repos:
         outcomes[repo['name']] = runner.process(repo, force)
     if not dry_run:
-        for key, value in github.publish(state, gh, git).items():
+        for key, value in github.publish(state, gh, git, require_receipts=not direct_test_executor).items():
             counts[key] = counts.get(key, 0) + value
     runner.retention()
     LOG.info('Invocation finished: %s; publication %s', json.dumps(outcomes, sort_keys=True),
@@ -1046,6 +1780,13 @@ def status(cfg, state):
         if run:
             print(f'    latest run {run["id"]} {run["status"]} at {when(run["started"])} cleanup={run["cleanup"]}: '
                   f'{run["summary"] or ""}{" error=" + run["error"] if run["error"] else ""}')
+        for task in state.tasks(name):
+            p = json.loads(task['proposal'])
+            print(f'    task {task["id"]}: {task["status"]} attempts={task["attempts"]} '
+                  f'next={when(task["next_eligible"])} {p["workflow"]}: {task["blocker"] or p["reason"]}')
+        catalog = state.catalog(name)
+        if catalog:
+            print('    scenarios: ' + ', '.join(f'{r["id"]}/{r["version"]}={r["state"]}' for r in catalog))
     pending = state.reports(('pending', 'uncertain', 'update', 'revalidate', 'prepared'))
     print('Pending publication:' if pending else 'Pending publication: none')
     for r in pending:
@@ -1061,10 +1802,12 @@ def status(cfg, state):
     for r in problems:
         print(f'  run {r["id"]} ({r["repo"]}) cleanup={r["cleanup"]} attempts={r["cleanup_attempts"]}: '
               f'{Path(r["directory"]) / "resources.jsonl"}')
+    for worker in state.pending_workers():
+        print(f'  worker {worker["name"]} run={worker["run_id"]} status={worker["status"]}; cleanup required')
     return 0
 
 
-def check(cfg, github_factory, state_dir):
+def check(cfg, github_factory, state_dir, direct_test_executor=False):
     """Validate setup without model calls or infrastructure mutations."""
     failed = []
 
@@ -1080,8 +1823,15 @@ def check(cfg, github_factory, state_dir):
     if cfg['missing']:
         print('      configured without a checkout (ignored): ' + ', '.join(cfg['missing']))
     try:
-        with tempfile.NamedTemporaryFile(dir=state_dir):
-            pass
+        if direct_test_executor:
+            with tempfile.NamedTemporaryFile(dir=state_dir):
+                pass
+        else:
+            parent = state_dir
+            while not parent.exists():
+                parent = parent.parent
+            if not os.access(parent, os.W_OK):
+                raise OSError('No write access to the nearest existing state parent')
         line(True, f'state directory writable: {state_dir}')
     except OSError as exc:
         line(False, f'state directory not writable: {state_dir} ({exc})')
@@ -1100,7 +1850,16 @@ def check(cfg, github_factory, state_dir):
                                               'push access for fix branches, PRs and issues'))
             except Failure as exc:
                 line(False, f'{name}: {exc}')
-    runner = Runner(cfg, None, None, None, state_dir)
+    if not direct_test_executor:
+        for name, profile in cfg['execution_profiles'].items():
+            try:
+                execution.DockerWorker(profile, 'check', 'check', lambda r: None).policy()
+                line(True, f'worker profile {name}: configuration inspected; authentication needs --check-worker')
+            except (Failure, OSError, ValueError) as exc:
+                line(False, f'worker profile {name}: {exc}')
+        line(bool(cfg['execution_profiles']), 'execution profile configured (required; no host fallback)')
+        return 1 if failed else 0
+    runner = Runner(cfg, None, None, None, state_dir, direct_test_executor=True)
     stages = [(r, s) for r in cfg['repositories'] for s in STAGES] or [
         ({'agents': cfg['agents'], 'test_environment': None}, s) for s in STAGES]
     done = set()
@@ -1120,6 +1879,22 @@ def check(cfg, github_factory, state_dir):
     return 1 if failed else 0
 
 
+def acknowledge_cleanup(state, run_id, note):
+    row = state.run(run_id)
+    if row is None or row['cleanup'] not in ('pending', 'failed') or row['status'] == 'running':
+        raise Failure('Choose a stopped run with pending/failed cleanup from --status')
+    if row['execution_mode'] == 'isolated' or state.db.execute(
+            'SELECT 1 FROM workers WHERE run_id=?', (run_id,)).fetchone():
+        raise Failure('Worker cleanup cannot be acknowledged; restore the original Docker daemon for recovery')
+    if not note.strip() or len(note) > 4000:
+        raise Failure('Cleanup acknowledgement requires a note of 1..4000 characters')
+    record = json.dumps({'time': time.time(), 'note': Redactor.from_environment()(note.strip())})
+    state._write("UPDATE runs SET cleanup='clean',cleanup_acknowledgement=? WHERE id=?", (record, run_id))
+    LOG.info('Operator acknowledged legacy cleanup for run %s', run_id)
+    print(f'Legacy cleanup acknowledged for {run_id}; no cleanup scripts were executed.')
+    return 0
+
+
 class Formatter(logging.Formatter):
     def __init__(self, tz):
         super().__init__('%(asctime)s %(levelname)s %(message)s')
@@ -1129,23 +1904,30 @@ class Formatter(logging.Formatter):
         return datetime.fromtimestamp(record.created, self.tz).isoformat(timespec='seconds')
 
 
-def main(argv=None, github_factory=github.GitHub):
+def main(argv=None, github_factory=github.GitHub, *, direct_test_executor=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=ROOT / 'config.json')
     parser.add_argument('--check', action='store_true', help='validate setup without model calls')
+    parser.add_argument('--check-worker', action='store_true', help='create a disposable boundary diagnostic worker')
     parser.add_argument('--once', action='store_true', help='one cycle over eligible repositories (cron)')
     parser.add_argument('--repo', help='only this owner/repo')
     parser.add_argument('--force', action='store_true', help='rerun --repo even if main is unchanged')
     parser.add_argument('--dry-run', action='store_true', help='test and prepare reports in separate state; never publish')
     parser.add_argument('--status', action='store_true', help='summarize state without model calls')
+    parser.add_argument('--acknowledge-cleanup', metavar='RUN_ID', help='record manually verified legacy cleanup')
+    parser.add_argument('--cleanup-note', help='what the operator verified and removed at the original target')
     args = parser.parse_args(argv)
-    if sum((args.check, args.status, args.once or bool(args.repo))) != 1:
-        parser.error('choose one of --check, --status, --once or --repo')
+    if sum((args.check, args.check_worker, args.status, args.once or bool(args.repo), bool(args.acknowledge_cleanup))) != 1:
+        parser.error('choose one of --check, --check-worker, --status, --once, --repo or --acknowledge-cleanup')
+    if bool(args.acknowledge_cleanup) != bool(args.cleanup_note):
+        parser.error('--acknowledge-cleanup requires --cleanup-note (and vice versa)')
     if args.force and not args.repo:
         parser.error('--force requires --repo')
     os.umask(0o077)
     cfg = load_config(args.config)
     root = cfg['state_directory']
+    if args.check and not direct_test_executor:
+        return check(cfg, github_factory, root / 'dry-run' if args.dry_run else root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
     state_dir = root / 'dry-run' if args.dry_run else root
@@ -1156,7 +1938,7 @@ def main(argv=None, github_factory=github.GitHub):
     LOG.setLevel(logging.INFO)
     try:
         if args.check:
-            return check(cfg, github_factory, state_dir)
+            return check(cfg, github_factory, state_dir, direct_test_executor)
         state = State(state_dir / 'state.sqlite3')
         try:
             if args.status:
@@ -1166,8 +1948,13 @@ def main(argv=None, github_factory=github.GitHub):
                     LOG.info('Invocation skipped: another invocation is still running')
                     print('auto-test: another invocation is still running')
                     return 0
+                if args.check_worker:
+                    return check_workers(cfg, state, state_dir)
+                if args.acknowledge_cleanup:
+                    return acknowledge_cleanup(state, args.acknowledge_cleanup, args.cleanup_note)
                 repo = args.repo.lower() if args.repo else None
-                return cycle(cfg, state, github_factory(), state_dir, repo, args.force, args.dry_run)
+                return cycle(cfg, state, github_factory(), state_dir, repo, args.force, args.dry_run,
+                             direct_test_executor)
         finally:
             state.close()
     except KeyboardInterrupt:

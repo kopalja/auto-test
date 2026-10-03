@@ -144,8 +144,12 @@ def _tail(path, size=2000):
 class Adapter:
     provider = label = ''
 
-    def __init__(self, binary):
+    def __init__(self, binary, executor=None):
         self.binary = binary
+        self.executor = executor
+
+    def run_command(self, args, **kwargs):
+        return (self.executor or command)(args, **kwargs)
 
     @classmethod
     def locate(cls):
@@ -161,7 +165,7 @@ class Codex(Adapter):
     def preflight(self, env):
         """ChatGPT subscription login only; an API-key login is rejected, not used."""
         try:
-            result = command([self.binary, 'login', 'status'], env=env, timeout=60, check=False)
+            result = self.run_command([self.binary, 'login', 'status'], env=env, timeout=60, check=False)
         except Exception as exc:
             raise AgentError(f'codex login status failed: {exc}', 'setup')
         text = (result.stdout + result.stderr).lower()
@@ -171,7 +175,7 @@ class Codex(Adapter):
     def check_model(self, model, effort, env):
         """Validate model/effort against the installed Codex catalog; returns a note."""
         try:
-            result = command([self.binary, 'debug', 'models'], env=env, timeout=60, check=False)
+            result = self.run_command([self.binary, 'debug', 'models'], env=env, timeout=60, check=False)
             models = json.loads(result.stdout)['models']
         except Exception:
             return 'catalog unavailable; model/effort proven only by a real invocation'
@@ -217,7 +221,7 @@ class Claude(Adapter):
     def preflight(self, env):
         """Claude subscription login only; any API-key source is rejected, not used."""
         try:
-            result = command([self.binary, 'auth', 'status', '--json'], env=env, timeout=60, check=False)
+            result = self.run_command([self.binary, 'auth', 'status', '--json'], env=env, timeout=60, check=False)
             status = json.loads(result.stdout)
         except Exception:
             raise AgentError('claude auth status failed (run `claude` and /login)', 'setup')
@@ -284,6 +288,113 @@ def _cap(path):
             handle.seek(-TRANSCRIPT_LIMIT // 4, os.SEEK_END)
             tail = handle.read()
         path.write_bytes(b'{"type":"truncated"}\n' + tail[tail.find(b'\n') + 1:])
+
+
+DISCOVERY_SCHEMA = _obj(**COMMON, findings=_arr(FINDING), worth_continuing=BOOL,
+    scenarios=_arr(_obj(path=STR, finding_index={'type': 'integer'})), recipe_path=STR,
+    unfinished=_arr(_obj(workflow=STR, invariant=STR, trigger=STR, reason=STR,
+                        requires=_arr(STR), priority={'type': 'integer'})))
+REVIEW_SCHEMA = _obj(supported=BOOL, observes_application=BOOL, existing_checks_adequate=BOOL,
+    expected_basis=STR, reason=STR, duplicate_of=NSTR, expectations_changed=BOOL, intentional_change_basis=NSTR)
+
+
+def worker_adapter(worker, cfg):
+    def execute(args, **kwargs):
+        r = worker.exec(args, timeout=kwargs.get('timeout', 60))
+        return subprocess.CompletedProcess(args, r['exit_code'], r['stdout'], r['stderr'])
+    adapter = ADAPTERS[cfg['provider']](cfg['provider'], execute)
+    adapter.preflight({})
+    adapter.check_model(cfg['model'], cfg['reasoning_effort'], {})
+    return adapter
+
+
+def run_worker_stage(worker, cfg, stage, context, destination, schema=None, instructions=''):
+    """Subscription CLIs run only inside the worker. Host output is a bounded import."""
+    from scenarios import canonical, write_files
+    from execution import relative
+    from util import Failure
+    schema = schema or SCHEMAS[stage]
+    adapter = worker_adapter(worker, cfg)
+    stage_name = destination.name
+    stage_path = Path('/work/run/stages') / stage_name
+    context = {**context, 'stage_directory': str(stage_path), 'workspace': '/work/workspace',
+               'run_directory': '/work/run', 'evidence_directory': '/work/run/evidence',
+               'resource_manifest': '/work/run/resources.jsonl'}
+    prompt_text = prompt(stage, context) + '\n\n' + instructions
+    worker.copy_in({f'stages/{stage_name}/schema.json': (canonical(schema), False),
+                    f'stages/{stage_name}/prompt.md': (prompt_text.encode(), False),
+                    'evidence/.keep': (b'', False)}, '/work/run')
+    args = adapter.command(cfg, Path('/work/workspace'), stage_path, schema, Path('/work/run'))
+    receipt = worker.exec(args, agent=True, data=prompt_text)
+    try:
+        exported = worker.copy_out('/work/run', [f'stages/{stage_name}'])
+    except (Failure, ValueError) as exc:
+        raise AgentError(f'Invalid stage export: {exc}', 'invalid') from exc
+    destination.mkdir(parents=True, exist_ok=True)
+    prefix = f'stages/{stage_name}/'
+    write_files(destination, {k[len(prefix):]: v for k, v in exported.items() if k.startswith(prefix)})
+    (destination / 'transcript.jsonl').write_text(receipt['stdout'])
+    (destination / 'stderr.log').write_text(receipt['stderr'])
+    (destination / 'command.json').write_bytes(canonical(receipt))
+    result = validate(adapter.parse(destination, receipt['exit_code']), schema)
+    def collect(path):
+        files = worker.copy_out('/work/run', [relative(path)])
+        merged = {**exported, **files}
+        if sum(len(data) for data, _ in merged.values()) > worker.profile['artifact_bytes']:
+            raise Failure('Combined stage exports exceed artifact limit')
+        exported.update(files)
+    if 'scenarios' in result:
+        accepted = []
+        for item in result['scenarios']:
+            try:
+                collect(item['path'])
+                accepted.append(item)
+            except (Failure, ValueError) as exc:
+                result['outcome'] = 'incomplete'
+                result['summary'] += f'\nRejected scenario export {item["path"]}: {exc}'
+        result['scenarios'] = accepted
+    if result.get('recipe_path'):
+        try:
+            collect(result['recipe_path'])
+        except (Failure, ValueError) as exc:
+            raise AgentError(f'Invalid recipe export: {exc}', 'invalid') from exc
+    (destination / 'result.json').write_bytes(canonical(result))
+    return result, exported
+
+
+EXPLORATORY_RULES = '''
+This run uses the isolated local worker protocol. This section replaces older instructions about
+host paths, remote targets, manual evidence, and detached services. Remote testing is unsupported.
+Agent logs are proposals, NEVER proof. Write scenario bundles under /work/run/scenarios/ID/.
+Each bundle has manifest.json and relative scripts/data matching their SHA256 hashes.
+Manifest keys (all required): schema_version=1, id, version (safe stable identifiers), title, workflow,
+component, kind (workflow/boundary/failure), hypothesis, expected_basis (specific documented citation),
+origin (agent/existing_test/owner), relevance_paths, requires (only advertised local capabilities),
+prepare_argv, run_argv, reset_argv (argument arrays, optional commands use []), timeout_seconds,
+seed (integer or null), assertion_ids, files (relative path -> SHA256).
+The runner persists this proposal BEFORE invoking it in fresh state. Use AUTO_TEST_BUNDLE for
+bundle files, /work/workspace as cwd, AUTO_TEST_REVISION for the pinned source, AUTO_TEST_SEED for data.
+Use python3 /work/bundle/check.py, for example. Script output ends with JSON:
+{"passed":["assertion-id"],"failed":[]} and exit 0; or exit 1 with named behavioral failures
+{"passed":[],"failed":[{"id":"assertion-id","observation":"actual interface/state observed"}]}.
+Cover every declared assertion once. Script/setup errors use exit 2. Never just echo an expected claim.
+No secrets, absolute host paths, old ports, historical run IDs, or authority extensions in bundles.
+Timeouts/crashes are inconclusive, not defects. Provide useful passing scenarios too.
+Write /work/run/recipe.json with schema_version=1, setup_argv, services (up to five FOREGROUND argv arrays),
+ready_argv, identity_argv, teardown_argv, checks_argv (relevant existing checks), relevance_paths.
+Source-mode recipes use no services; identity_argv may read AUTO_TEST_REVISION. Deployment recipes
+must query the running application's revision independently; services start in the copied source.
+Readiness retries must be bounded. Service scripts can read AUTO_TEST_REVISION. Project dependencies
+must already exist in the image or use the allowed gateway. The runner starts persistent services;
+ordinary descendants of an agent session are terminated at session end.
+Return recipe_path="recipe.json" and scenarios [{"path":"scenarios/ID","finding_index":-1}].
+finding_index=-1 means useful passing hypothesis; otherwise index into findings. Every finding needs a bundle.
+Only documented contracts/invariants support assertions. Unsupported assumptions stay in unfinished.
+Deduplicate against catalog workflow/invariant/trigger; existing-test reruns aren't new discovery.
+Prioritize changed workflows, due concrete tasks, important under-tested invariants, then rotation.
+Return unfinished concrete {workflow,invariant,trigger,reason,requires,priority(0..100)} proposals when
+budget/capabilities prevent completion. Never queue generic 'more testing'. No bug quota.
+'''
 
 
 RULES = '''You are an automated bug-hunting agent started by auto-test, a nightly runner. Work noninteractively; nobody will answer questions.

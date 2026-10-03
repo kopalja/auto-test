@@ -156,12 +156,18 @@ def _excerpts(paths, redact, limit=3000):
     lines = []
     for path in paths[:3]:
         try:
-            content = Path(path).read_text(errors='replace')
+            source = Path(path)
+            if source.is_symlink() or not source.is_file():
+                continue
+            with source.open('rb') as handle:
+                size = handle.seek(0, 2)
+                handle.seek(max(0, size - limit * 4))
+                content = handle.read(limit * 4).decode('utf8', 'replace')
         except OSError:
             continue
         excerpt = content[-limit:]
         lines += [f'<details><summary>{html.escape(Path(path).name)}'
-                  f'{" (tail)" if len(content) > limit else ""}</summary>', '', code(excerpt, redact), '',
+                  f'{" (tail)" if size > limit else ""}</summary>', '', code(excerpt, redact), '',
                   '</details>', '']
     return lines
 
@@ -240,11 +246,27 @@ def sync(state, gh):
             LOG.info('Report %s is %s', row['url'], current)
 
 
-def publish(state, gh, git):
+def receipt_gate(state, row):
+    """Published history is untouched; pending legacy/model-only evidence needs revalidation."""
+    if row['kind'] == 'blocker':
+        return True
+    from scenarios import proof_ok
+    data = json.loads(row['data'])
+    receipts = state.proof_receipts(data.get('receipt_ids'))
+    return proof_ok(receipts, data['repo'], data['sha'], data.get('bundle_hash'),
+                    data.get('commit') if row['kind'] == 'pr' else None)
+
+
+def publish(state, gh, git, require_receipts=True):
     """Publish due reports. Failures are recorded and retried by later invocations."""
     counts = {'published': 0, 'recovered': 0, 'deferred': 0, 'failed': 0}
     for row in state.due_reports():
         try:
+            if require_receipts and not receipt_gate(state, row):
+                state.update_report(row['key'], status='revalidate',
+                                    error='Fresh runner baseline receipts and semantic review required')
+                counts['deferred'] += 1
+                continue
             outcome = (publish_pr if row['kind'] == 'pr' else publish_issue)(state, gh, git, row)
             counts[outcome] += 1
         except Exception as exc:  # One report must not block the others; all failures retry later.

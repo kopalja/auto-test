@@ -203,7 +203,8 @@ class Case(unittest.TestCase):
         buffer = io.StringIO()
         try:
             with contextlib.redirect_stdout(buffer):
-                return auto_test.main(['--config', str(path), *args], github_factory=lambda: self.gh)
+                return auto_test.main(['--config', str(path), *args], github_factory=lambda: self.gh,
+                                      direct_test_executor=True)
         finally:
             self.stdout = buffer.getvalue()
 

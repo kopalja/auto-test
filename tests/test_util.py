@@ -27,6 +27,7 @@ if sys.argv[2] == 'stay':
 '''
 
 
+@unittest.skipUnless(sys.platform == 'linux', 'Process-tree assertions require Linux /proc')
 class ProcessCleanupTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -92,3 +93,14 @@ class ProcessCleanupTest(unittest.TestCase):
     def kill_child(self, pid):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
+
+
+class StopPermissionTest(unittest.TestCase):
+    def test_permission_error_does_not_mask_original_interruption(self):
+        proc = mock.Mock(pid=123)
+        with mock.patch('util.os.killpg', side_effect=PermissionError), self.assertRaises(KeyboardInterrupt):
+            try:
+                raise KeyboardInterrupt()
+            finally:
+                stop(proc, grace=.01)
+        proc.wait.assert_called_once()

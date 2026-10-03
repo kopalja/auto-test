@@ -28,7 +28,7 @@ def stop(proc, grace=10):
         proc.poll()  # Reap the leader, but wait for surviving group members too.
         try:
             os.killpg(proc.pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             break
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -36,8 +36,8 @@ def stop(proc, grace=10):
     proc.wait()
 
 
-def command(args, *, cwd=None, env=None, data=None, timeout=300, check=True):
-    """Run a short git/gh command with an argument array; returns CompletedProcess with text output."""
+def command(args, *, cwd=None, env=None, data=None, timeout=300, check=True, binary=False):
+    """Run a short git/gh command; binary=True preserves stdout bytes (stderr stays text)."""
     proc = subprocess.Popen([str(a) for a in args], cwd=cwd, env=env, start_new_session=True,
                             stdin=subprocess.DEVNULL if data is None else subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -49,7 +49,7 @@ def command(args, *, cwd=None, env=None, data=None, timeout=300, check=True):
     except BaseException:
         stop(proc, grace=2)
         raise
-    result = subprocess.CompletedProcess(args, proc.returncode, out.decode('utf-8', 'replace'),
+    result = subprocess.CompletedProcess(args, proc.returncode, out if binary else out.decode('utf-8', 'replace'),
                                          err.decode('utf-8', 'replace'))
     if check and result.returncode:
         raise Failure(f'{_name(args)} exited {result.returncode}', detail=result.stderr.strip()[-500:])

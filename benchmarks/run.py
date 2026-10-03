@@ -23,6 +23,7 @@ class NoPublication:
 
 
 def run_trial(cfg, ident, variant, directory, snapshot=None, review_only=False):
+    directory = directory.resolve()
     directory.mkdir(parents=True)
     source = directory / 'source'
     if snapshot:

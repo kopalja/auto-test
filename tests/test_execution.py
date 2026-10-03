@@ -321,6 +321,16 @@ print(json.dumps({'passed':[] if failed else ['zero'],'failed':failed})); exit(1
 
 @unittest.skipUnless(sys.platform == 'linux', 'Worker subreaper uses Linux prctl and /proc')
 class LinuxSupervisorTest(unittest.TestCase):
+    def test_timed_out_child_preserves_sigkill_exit_status(self):
+        payload = dict(argv=[sys.executable, '-c', 'import time; time.sleep(30)'],
+                       cwd=str(Path.cwd()), env={}, limit=1000, timeout=.02)
+        for _ in range(10):
+            result = subprocess.run([sys.executable, '-c', execution.SUPERVISOR], input=json.dumps(payload),
+                                    text=True, capture_output=True, timeout=5, check=True)
+            receipt = json.loads(result.stdout)
+            self.assertTrue(receipt['timed_out'])
+            self.assertEqual((receipt['exit_code'], receipt['signal']), (-9, 9))
+
     def test_detached_session_descendants_are_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             pidfile = Path(directory) / 'pid'

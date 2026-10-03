@@ -209,6 +209,14 @@ redacts known secrets/token patterns. Inspect artifacts before sharing: patterns
 catch every secret. Schedule only after validation, e.g. your own cron invoking
 `cd /path/to/auto-test && ./bin/run --once`. A lock skips overlaps; cron is not activated automatically.
 
+Legacy cleanup obligations block new work and preserve their manifests. Use `--status` to
+find the run ID and original manifest; inspect its saved deployment record when applicable.
+After manually removing the run-owned resources at the original target and verifying cleanup,
+record the action with `./bin/run --acknowledge-cleanup RUN_ID --cleanup-note "Verified ...; removed ..."`.
+This only records the operator's acknowledgement and executes no scripts. It cannot clear
+Docker worker obligations; restore the original daemon so normal recovery can verify removal.
+Use `--dry-run` to acknowledge a legacy run in the separate dry-run state.
+
 ## Tests and evaluation
 
 ```sh

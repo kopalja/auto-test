@@ -185,7 +185,8 @@ finally:
         for pid in descendants:
             try: os.kill(pid, signal.SIGKILL)
             except ProcessLookupError: pass
-        child.poll()
+        # Popen must reap its own child to preserve the real signal/exit status.
+        child.wait()
         try:
             while os.waitpid(-1, os.WNOHANG)[0]: pass
         except ChildProcessError: pass

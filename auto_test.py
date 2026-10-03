@@ -535,6 +535,10 @@ class Runner:
 
     def recover_isolated(self):
         self.state.mark_interrupted()
+        # Include runs already marked interrupted by an earlier migration/recovery.
+        for row in self.state.db.execute("SELECT * FROM runs WHERE status='interrupted' AND cleanup='none'").fetchall():
+            if row['deployment'] is not None or unresolved(Path(row['directory']) / 'resources.jsonl'):
+                self.state.set_cleanup(row['id'], 'pending')
         for row in self.state.pending_workers():
             record = json.loads(row['record'])
             worker = execution.DockerWorker(record['profile'], row['run_id'], row['name'],
@@ -559,8 +563,14 @@ class Runner:
         name = repo['name']
         if any(exc.kind == 'deferred' for exc in self.unusable.values()):
             return 'deferred'
-        if any(r['repo'] == name for r in self.state.cleanup_problems()):
+        cleanup = [r for r in self.state.cleanup_problems() if r['repo'] == name]
+        if cleanup:
             LOG.warning('%s: recover original cleanup obligations before starting new work', name)
+            self.blocker(name, '', '', 'resource cleanup', 'infrastructure',
+                'Pending cleanup for runs: ' + ', '.join(r['id'] for r in cleanup),
+                'Run --status and inspect the original resource manifests/deployment records. Restore the original '
+                'Docker daemon for worker cleanup. For legacy resources, clean them manually at the original target, '
+                'then use --acknowledge-cleanup RUN_ID --cleanup-note "what was verified and removed".')
             return 'blocked'
         profile = self.cfg['execution_profiles'].get(repo.get('execution_profile'))
         if profile is None:
@@ -709,10 +719,18 @@ class Runner:
             self.state.touch_scenario(r)
             if r['cleanup'] != 'clean':
                 raise Failure('Replay cleanup failed; dependent work stopped')
-            if r.get('setup_ok'):
+            if not scenarios.environment_failure(r):
                 completed_tasks.update(t['id'] for t in tasks
                                        if json.loads(t['proposal'])['workflow'] == 'local setup')
             return r
+
+        def require_environment(receipt, manifest):
+            if scenarios.environment_failure(receipt):
+                reason = receipt.get('error') or receipt.get('artifact_error') or 'Replay environment unavailable'
+                queue({'workflow': manifest['workflow'], 'invariant': manifest['expected_basis'],
+                       'trigger': manifest['hypothesis'], 'reason': reason, 'requires': manifest['requires'],
+                       'priority': 70, 'scenario_id': manifest['id'], 'version': manifest['version']}, reason)
+                raise WorkerSetupFailure(reason)
 
         def accept_recipe(result, exported):
             nonlocal recipe, workflow_passed
@@ -766,6 +784,7 @@ class Runner:
                     continue
                 r = run_bundle(Path(row['bundle']))
                 replayed.append({'id': row['id'], 'version': row['version'], 'outcome': r['outcome']})
+                require_environment(r, m)
                 workflow_passed |= m['kind'] == 'workflow' and r['outcome'] == 'passed'
                 if r['outcome'] == 'passed':
                     for task in tasks:
@@ -774,6 +793,7 @@ class Runner:
                             completed_tasks.add(task['id'])
                 if r['outcome'] != 'passed':
                     second = run_bundle(Path(row['bundle']))
+                    require_environment(second, m)
                     self.state.scenario_result(name, row['id'], row['version'], [r, second])
                     failures.append({'scenario': {k: row[k] for k in ('id', 'version', 'metadata', 'reason')},
                                      'receipts': [r, second]})
@@ -934,14 +954,16 @@ class Runner:
                                'reason': 'Baseline workflow has not passed; fault injection blocked',
                                'requires': m['requires'], 'priority': 60})
                         continue
-                    before = [run_bundle(path), run_bundle(path)]
-                    self.state.scenario_result(name, m['id'], m['version'], before)
+                    before = []
+                    for _ in range(2):
+                        receipt = run_bundle(path)
+                        before.append(receipt)
+                        require_environment(receipt, m)
+                    consistent = self.state.scenario_result(name, m['id'], m['version'], before)
                     discovered.append({'id': m['id'], 'version': m['version'], 'kind': m['kind'],
                                        'origin': m['origin'], 'outcome': before[-1]['outcome'],
                                        'new': content_hash not in seen_scenario_hashes})
                     seen_scenario_hashes.add(content_hash)
-                    consistent = before[0]['outcome'] == before[1]['outcome'] and \
-                        before[0]['outcome'] in ('passed', 'failed') and all(r['reset_ok'] for r in before)
                     if consistent:
                         self.state.save_recipe(name, recipe, sha, policy_hash, validated=True)
                         workflow_passed |= m['kind'] == 'workflow' and before[-1]['outcome'] == 'passed'
@@ -1000,14 +1022,14 @@ class Runner:
                                     'assertions or introducing regressions.', revision=commit,
                                     files=scenarios.snapshot(self.git, name, commit, profile['artifact_bytes']))
                                 stop_worker()
-                                if patch_review['verdict'] == 'rejected':
-                                    run.unpublished.append(m['id'] + ': ' + patch_review['reason'])
-                                    continue
                                 if scenarios.proof_ok([*before, after], name, sha, content_hash, commit) and \
                                         patch_review['verdict'] == 'confirmed' and patch_review['fix_verdict'] == 'effective':
                                     kind = 'pr'
                                     self.state.link_scenario(name, m['id'], m['version'], key,
                                         json.dumps(fix['regression_tests']) if fix['regression_tests'] else None)
+                                else:
+                                    fix_notes.append('Optional patch was not verified effective: ' + patch_review['reason'])
+                                    kind, fix, commit, branch = 'issue', None, None, None
                         except (Failure, AgentError, OSError, ValueError) as exc:
                             fix_notes.append('Optional fix failed: ' + str(exc))
                             run.unpublished.append(m['id'] + ': ' + fix_notes[-1])
@@ -1047,12 +1069,17 @@ class Runner:
             agent_error = isinstance(exc, AgentError) and exc.kind != 'setup'
             if isinstance(exc, AgentError) and exc.kind == 'deferred':
                 self.unusable['subscription'] = exc
-            status = 'blocked' if isinstance(exc, AgentError) and exc.kind == 'setup' else 'incomplete'
+            status = 'blocked' if isinstance(exc, WorkerSetupFailure) or \
+                isinstance(exc, AgentError) and exc.kind == 'setup' else 'incomplete'
             error = str(exc)
             LOG.error('Run %s: %s', run_id, exc)
             if isinstance(exc, AgentError) and exc.kind == 'setup':
                 self.blocker(name, sha, run_id, 'worker provider setup', 'credentials', error,
                              'Restore the dedicated worker subscription login/model and run --check-worker.')
+            if isinstance(exc, WorkerSetupFailure):
+                self.blocker(name, sha, run_id, 'isolated worker setup', 'infrastructure', error,
+                    'Check the Docker daemon, worker image/network policy, quotas and recipe setup logs. '
+                    'Repair the cause, run --check-worker, then retry this repository with --force.')
             if isinstance(exc, WorkerSetupFailure) or isinstance(exc, AgentError) and exc.kind == 'setup':
                 queue({'workflow': 'local setup', 'invariant': 'worker and recipe usable', 'trigger': 'resume setup',
                        'reason': error, 'requires': [], 'priority': 100}, error)
@@ -1852,6 +1879,22 @@ def check(cfg, github_factory, state_dir, direct_test_executor=False):
     return 1 if failed else 0
 
 
+def acknowledge_cleanup(state, run_id, note):
+    row = state.run(run_id)
+    if row is None or row['cleanup'] not in ('pending', 'failed') or row['status'] == 'running':
+        raise Failure('Choose a stopped run with pending/failed cleanup from --status')
+    if row['execution_mode'] == 'isolated' or state.db.execute(
+            'SELECT 1 FROM workers WHERE run_id=?', (run_id,)).fetchone():
+        raise Failure('Worker cleanup cannot be acknowledged; restore the original Docker daemon for recovery')
+    if not note.strip() or len(note) > 4000:
+        raise Failure('Cleanup acknowledgement requires a note of 1..4000 characters')
+    record = json.dumps({'time': time.time(), 'note': Redactor.from_environment()(note.strip())})
+    state._write("UPDATE runs SET cleanup='clean',cleanup_acknowledgement=? WHERE id=?", (record, run_id))
+    LOG.info('Operator acknowledged legacy cleanup for run %s', run_id)
+    print(f'Legacy cleanup acknowledged for {run_id}; no cleanup scripts were executed.')
+    return 0
+
+
 class Formatter(logging.Formatter):
     def __init__(self, tz):
         super().__init__('%(asctime)s %(levelname)s %(message)s')
@@ -1871,9 +1914,13 @@ def main(argv=None, github_factory=github.GitHub, *, direct_test_executor=False)
     parser.add_argument('--force', action='store_true', help='rerun --repo even if main is unchanged')
     parser.add_argument('--dry-run', action='store_true', help='test and prepare reports in separate state; never publish')
     parser.add_argument('--status', action='store_true', help='summarize state without model calls')
+    parser.add_argument('--acknowledge-cleanup', metavar='RUN_ID', help='record manually verified legacy cleanup')
+    parser.add_argument('--cleanup-note', help='what the operator verified and removed at the original target')
     args = parser.parse_args(argv)
-    if sum((args.check, args.check_worker, args.status, args.once or bool(args.repo))) != 1:
-        parser.error('choose one of --check, --status, --once or --repo')
+    if sum((args.check, args.check_worker, args.status, args.once or bool(args.repo), bool(args.acknowledge_cleanup))) != 1:
+        parser.error('choose one of --check, --check-worker, --status, --once, --repo or --acknowledge-cleanup')
+    if bool(args.acknowledge_cleanup) != bool(args.cleanup_note):
+        parser.error('--acknowledge-cleanup requires --cleanup-note (and vice versa)')
     if args.force and not args.repo:
         parser.error('--force requires --repo')
     os.umask(0o077)
@@ -1903,6 +1950,8 @@ def main(argv=None, github_factory=github.GitHub, *, direct_test_executor=False)
                     return 0
                 if args.check_worker:
                     return check_workers(cfg, state, state_dir)
+                if args.acknowledge_cleanup:
+                    return acknowledge_cleanup(state, args.acknowledge_cleanup, args.cleanup_note)
                 repo = args.repo.lower() if args.repo else None
                 return cycle(cfg, state, github_factory(), state_dir, repo, args.force, args.dry_run,
                              direct_test_executor)

@@ -231,6 +231,16 @@ def proof_ok(receipts, repo, baseline, bundle_hash, patched=None):
         and len({r.get('recipe_hash') for r in chosen}) == 1
 
 
+def environment_failure(receipt):
+    """Keep reviewed scenarios reusable when the worker or application setup is unhealthy."""
+    return not receipt.get('setup_ok') or bool(receipt.get('artifact_error') or receipt.get('execution_error')) \
+        or receipt.get('failure_phase') in ('worker_setup', 'setup', 'services', 'readiness', 'identity',
+                                            'existing_checks', 'teardown') \
+        or any(c.get('limit') in ('memory_limit', 'process_limit', 'storage_limit') or
+               c.get('timed_out') and c['phase'] in ('setup', 'readiness', 'identity', 'existing_checks', 'teardown')
+               for c in receipt.get('commands', []))
+
+
 class Replay:
     def __init__(self, state, directory, profile, run_id, repo, worker_factory=DockerWorker):
         self.state, self.directory, self.profile = state, directory, profile
@@ -267,12 +277,19 @@ class Replay:
                                      lambda record: self.state.save_worker(self.run_id, record))
         timeout = manifest['timeout_seconds']
         start_attempted = False
+        phase = 'worker_setup'
         env = {'AUTO_TEST_REVISION': revision, 'AUTO_TEST_SEED': str(manifest['seed'] or 0),
                'AUTO_TEST_BUNDLE': '/work/bundle', 'PYTHONPATH': '/work/workspace'}
 
         def run(a, label):
+            nonlocal phase
+            phase = label
             seconds = timeout if label in ('prepare', 'assertions', 'reset') else self.profile['max_command_seconds']
-            result = worker.exec(a, timeout=seconds, env=env)
+            try:
+                result = worker.exec(a, timeout=seconds, env=env)
+            except (Failure, OSError, ValueError) as exc:
+                receipt['execution_error'] = str(exc)
+                raise
             receipt['commands'].append({'phase': label, **result})
             self.state.save_execution(receipt)
             return result
@@ -295,6 +312,7 @@ class Replay:
                 recipe(deployment)
                 if deployment['setup_argv']:
                     success(deployment['setup_argv'], 'setup')
+                phase = 'services'
                 for service in deployment['services']:
                     worker.service(service, env=env)
                 success(deployment['ready_argv'], 'readiness')
@@ -313,6 +331,7 @@ class Replay:
                 receipt['outcome'], receipt['assertions'] = assertions(result, manifest['assertion_ids'])
         except (Failure, OSError, ValueError) as exc:
             receipt['error'] = str(exc)
+            receipt['failure_phase'] = phase
         except BaseException:
             receipt['error'] = 'interrupted'
             raise
@@ -333,6 +352,7 @@ class Replay:
                         success(deployment['teardown_argv'], 'teardown')
             except (Failure, OSError, ValueError) as exc:
                 receipt['error'] = str(exc)
+                receipt['failure_phase'] = phase
                 receipt['outcome'] = 'inconclusive'
             finally:
                 try:

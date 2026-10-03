@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS runs(
   status TEXT NOT NULL, started REAL NOT NULL, finished REAL, agents TEXT NOT NULL,
   directory TEXT NOT NULL, summary TEXT, error TEXT,
   cleanup TEXT NOT NULL DEFAULT 'none', cleanup_attempts INTEGER NOT NULL DEFAULT 0,
-  pruned INTEGER NOT NULL DEFAULT 0, deployment TEXT, execution_mode TEXT);
+  pruned INTEGER NOT NULL DEFAULT 0, deployment TEXT, execution_mode TEXT, cleanup_acknowledgement TEXT);
 CREATE TABLE IF NOT EXISTS reports(
   key TEXT PRIMARY KEY, base_key TEXT NOT NULL, generation INTEGER NOT NULL, kind TEXT NOT NULL,
   repo TEXT NOT NULL, target TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
@@ -56,7 +56,8 @@ class State:
         self.db.executescript('PRAGMA journal_mode=WAL;' + SCHEMA)
         # Old checkpoints have no reliable mode once their artifacts are pruned. Recheck once.
         for table, column, definition in (('checkpoints', 'mode', "TEXT NOT NULL DEFAULT 'unknown'"),
-                                           ('runs', 'deployment', 'TEXT'), ('runs', 'execution_mode', 'TEXT')):
+                                           ('runs', 'deployment', 'TEXT'), ('runs', 'execution_mode', 'TEXT'),
+                                           ('runs', 'cleanup_acknowledgement', 'TEXT')):
             if column not in {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}:
                 self._write(f'ALTER TABLE {table} ADD COLUMN {column} {definition}', ())
 
@@ -253,6 +254,7 @@ class State:
                     'WHERE repo=? AND id=? AND version=?',
                     (state, reason, current['revision'], current['started'], current['outcome'], current['revision'],
                      current['outcome'], current['revision'], repo, ident, version))
+        return state == 'active'
 
     def touch_scenario(self, receipt):
         outcome = receipt['outcome']

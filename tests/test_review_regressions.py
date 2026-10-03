@@ -15,6 +15,8 @@ import scenarios
 import test_execution as fixtures
 from helpers import Case
 from test_scenarios import FakeWorker, bundle, recipe
+from util import Failure, digest
+from state import State
 
 
 class PipelineReviewTest(Case):
@@ -27,6 +29,145 @@ class PipelineReviewTest(Case):
         result, exported = self.stages(passing=True)[1][0]
         result['scenarios'] = []
         return result, exported
+
+    def test_interrupted_legacy_resources_survive_retention_and_can_be_acknowledged(self):
+        self.configure()
+        with self.patches([self.empty_discovery()])[0]:
+            self.run_real_path('--once')
+        state = self.state()
+        directory = self.tmp / 'var' / 'runs' / 'legacy'
+        directory.mkdir()
+        manifest = directory / 'resources.jsonl'
+        manifest.write_text(json.dumps({'action': 'created', 'kind': 'service', 'name': 'owned', 'target': 'old-test'}) + '\n')
+        state.start_run('legacy', 'owner/calc', self.head(), False, {}, directory)
+        # Exercise the migration case where a prior recovery already marked it interrupted.
+        state.finish_run('legacy', 'interrupted', 'legacy interrupted')
+        state._write('UPDATE runs SET finished=? WHERE id=?', (time.time() - 86400 * 60, 'legacy'))
+        with self.patches([])[0]:
+            self.assertEqual(self.run_real_path('--repo', 'owner/calc', '--force'), 1)
+        self.assertEqual(state.run('legacy')['cleanup'], 'pending')
+        self.assertEqual(state.run('legacy')['pruned'], 0)
+        self.assertTrue(manifest.exists())
+        self.assertTrue(any('resource cleanup' in r['title'] and r['status'] == 'published' for r in self.reports()))
+        calls = list(self.gh.calls)
+        self.assertEqual(self.run_real_path('--acknowledge-cleanup', 'legacy', '--cleanup-note',
+                                           'Removed owned service at old-test and verified absence'), 0)
+        self.assertEqual(self.gh.calls, calls)
+        self.assertEqual(state.run('legacy')['cleanup'], 'clean')
+        self.assertIn('verified absence', json.loads(state.run('legacy')['cleanup_acknowledgement'])['note'])
+        with self.patches([self.empty_discovery()])[0]:
+            self.assertEqual(self.run_real_path('--repo', 'owner/calc', '--force'), 0)
+
+    def test_freshly_interrupted_legacy_manifest_becomes_pending(self):
+        self.configure()
+        with self.patches([self.empty_discovery()])[0]:
+            self.run_real_path('--once')
+        directory = self.tmp / 'legacy-running'
+        directory.mkdir()
+        (directory / 'resources.jsonl').write_text(json.dumps(
+            {'action': 'created', 'kind': 'job', 'name': 'owned', 'target': 'old-test'}))
+        state = self.state()
+        state.start_run('legacy-running', 'owner/calc', self.head(), False, {}, directory)
+        with self.patches([])[0]:
+            self.assertEqual(self.run_real_path('--once'), 1)
+        self.assertEqual((state.run('legacy-running')['status'], state.run('legacy-running')['cleanup']),
+                         ('interrupted', 'pending'))
+
+    def test_alternating_failure_ids_quarantine_and_keep_repair_task(self):
+        self.configure()
+        with self.patches([self.empty_discovery()])[0]:
+            self.run_real_path('--once')
+        state = self.state()
+        m, responses = self.stages()
+        m['assertion_ids'] = ['zero', 'another']
+        responses[0][1]['scenarios/zero/manifest.json'] = (json.dumps(m).encode(), False)
+        proposal = dict(workflow=m['workflow'], invariant=m['expected_basis'], trigger=m['hypothesis'], reason='retry')
+        ident = digest(':'.join(proposal[k] for k in ('workflow', 'invariant', 'trigger')), 32)
+        fingerprint = state.db.execute('SELECT fingerprint FROM recipes').fetchone()[0]
+        state.enqueue('owner/calc', ident, proposal, 50, self.head(), 'old', fingerprint)
+        original, count = FakeWorker.exec, [0]
+        def alternating(worker, argv, **kwargs):
+            r = original(worker, argv, **kwargs)
+            if '/work/bundle/check.py' in argv:
+                count[0] += 1
+                failed, passed = ('zero', 'another') if count[0] % 2 else ('another', 'zero')
+                r.update(exit_code=1, stdout=json.dumps({'passed': [passed], 'failed': [
+                    {'id': failed, 'observation': 'alternating defect'}]}))
+            return r
+        with self.patches(responses)[0], mock.patch.object(FakeWorker, 'exec', alternating):
+            self.assertEqual(self.run_real_path('--once'), 0)
+        self.assertEqual(state.catalog('owner/calc')[0]['state'], 'quarantined')
+        self.assertEqual(state.tasks('owner/calc')[0]['id'], ident)
+        self.assertFalse(self.reports())
+
+    def test_transient_setup_and_artifact_failures_leave_active_library_reusable(self):
+        self.configure()
+        m, responses = self.stages(passing=True)
+        responses[0][0]['scenarios'].append({'path': 'scenarios/second', 'finding_index': -1})
+        responses[0][1].update({k.replace('scenarios/zero/', 'scenarios/second/'): v
+                                for k, v in list(responses[0][1].items()) if k.startswith('scenarios/zero/')})
+        responses[0][1]['scenarios/second/manifest.json'] = (json.dumps({**m, 'id': 'second'}).encode(), False)
+        responses.append(responses[1])
+        with self.patches(responses)[0]:
+            self.run_real_path('--once')
+        state = self.state()
+        original_exec, original_copy = FakeWorker.exec, FakeWorker.copy_out
+        for failure in ('readiness', 'artifacts'):
+            with self.subTest(failure=failure):
+                before = len(state.executions('owner/calc'))
+                def execute(worker, argv, **kwargs):
+                    r = original_exec(worker, argv, **kwargs)
+                    if failure == 'readiness' and argv == recipe()['ready_argv']:
+                        r.update(exit_code=2, stderr='temporary dependency outage')
+                    return r
+                def copy_out(worker, source, paths=None):
+                    if failure == 'artifacts' and paths is None:
+                        raise Failure('temporary artifact transfer failure')
+                    return original_copy(worker, source, paths)
+                with self.patches([])[0], mock.patch.object(FakeWorker, 'exec', execute), \
+                        mock.patch.object(FakeWorker, 'copy_out', copy_out):
+                    self.assertEqual(self.run_real_path('--repo', 'owner/calc', '--force'), 1)
+                self.assertEqual(len(state.executions('owner/calc')), before + 1)
+                self.assertEqual([r['state'] for r in state.catalog('owner/calc')], ['active', 'active'])
+                with self.patches([self.empty_discovery()])[0]:
+                    self.assertEqual(self.run_real_path('--repo', 'owner/calc', '--force'), 0)
+                self.assertFalse(state.tasks('owner/calc'))
+
+    def test_rejected_patch_review_preserves_confirmed_baseline_issue(self):
+        self.configure()
+        _, responses = self.stages()
+        responses[0][0]['findings'][0]['disposition'] = 'fix'
+        from fake_agent import default
+        fix = {**default('fixing'), 'fixed': True, 'files': ['calc.py'], 'regression_tests': []}
+        rejected = {**default('verification'), 'verdict': 'rejected', 'fix_verdict': 'ineffective',
+                    'reason': 'Patch introduces another regression'}
+        def stage(worker, cfg, role, *args, **kwargs):
+            if role == 'fixing':
+                worker.copy_in({'calc.py': (b'def divide(a,b): return a/b if b else None\n', False)}, '/work/workspace')
+                return fix, {}
+            return responses.pop(0) if responses else (rejected, {})
+        with self.patches(stage)[0]:
+            self.assertEqual(self.run_real_path('--once'), 0)
+        [report] = self.reports()
+        self.assertEqual((report['kind'], report['status']), ('issue', 'published'))
+        data = json.loads(report['data'])
+        self.assertEqual(len(data['receipt_ids']), 2)
+        self.assertIn(rejected['reason'], report['body'])
+        self.assertFalse(self.state().pending_workers())
+
+    def test_worker_startup_failure_publishes_deduplicated_blocker_and_pauses(self):
+        self.configure()
+        for _ in range(3):
+            with self.patches([])[0], mock.patch.object(FakeWorker, 'start', side_effect=Failure('Network policy rejected')):
+                self.assertEqual(self.run_real_path('--repo', 'owner/calc', '--force'), 1)
+        [report] = self.reports()
+        self.assertEqual((report['kind'], report['status']), ('blocker', 'published'))
+        self.assertIn('Network policy rejected', report['body'])
+        self.assertIn('--check-worker', report['body'])
+        self.assertEqual(self.state().tasks('owner/calc')[0]['attempts'], 3)
+        with self.patches([])[0]:
+            self.assertEqual(self.run_real_path('--once'), 0)
+        self.assertEqual(len(self.runs()), 3)
 
     def test_snapshot_preserves_export_ignored_and_substituted_blobs_and_modes(self):
         upstream = self.upstreams['owner/calc']
@@ -285,6 +426,33 @@ class PipelineReviewTest(Case):
             self.run_real_path('--once')
         self.assertEqual(state.run('isolated')['cleanup'], 'clean')
         self.assertEqual(state.run('legacy')['cleanup'], 'pending')
+
+
+class CleanupAcknowledgementTest(unittest.TestCase):
+    def test_legacy_deployment_acknowledgement_preserves_record(self):
+        state = State(':memory:')
+        self.addCleanup(state.close)
+        state.start_run('legacy', 'owner/repo', 'sha', False, {}, Path('/unused'))
+        state.finish_run('legacy', 'interrupted', 'old deployment')
+        state.save_deployment('legacy', {'target': 'original-test-account'})
+        state.set_cleanup('legacy', 'failed')
+        self.assertEqual(auto_test.acknowledge_cleanup(state, 'legacy', 'Verified original test account is clean'), 0)
+        self.assertEqual(state.run('legacy')['cleanup'], 'clean')
+        self.assertEqual(json.loads(state.run('legacy')['deployment']), {'target': 'original-test-account'})
+
+    def test_acknowledgement_rejects_workers_running_runs_and_empty_notes(self):
+        state = State(':memory:')
+        self.addCleanup(state.close)
+        for ident, mode in [('isolated', 'isolated'), ('recorded-worker', None), ('running', None), ('empty', None)]:
+            state.start_run(ident, 'owner/repo', 'sha', False, {}, Path('/unused'), execution_mode=mode)
+            state.set_cleanup(ident, 'pending')
+            if ident != 'running':
+                state.finish_run(ident, 'interrupted', '')
+        state.save_worker('recorded-worker', {'name': 'owned', 'status': 'removed'})
+        for ident in ('isolated', 'recorded-worker', 'running', 'empty', 'missing'):
+            with self.subTest(run=ident), self.assertRaises(Failure):
+                auto_test.acknowledge_cleanup(state, ident, '' if ident == 'empty' else 'verified')
+        self.assertTrue(all(r['cleanup'] == 'pending' for r in state.cleanup_problems()))
 
 
 class ExportReviewTest(unittest.TestCase):
